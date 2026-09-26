@@ -1,14 +1,48 @@
 #!/bin/sh
-# Runs as root, from the uninstaller package (which installs no files) or from the
-# "Uninstall Fast Track Pro 24-bit" app, where it is bundled as uninstall.sh.
-# Remove the plug-in, stop it, and give the Fast Track Pro back to the macOS driver.
+# Runs as root, from the uninstaller package (which installs no files), from the
+# "Uninstall Fast Track Pro 24-bit" app, where it is bundled as uninstall.sh, and from
+# `make uninstall`. Undoes everything the installer and the plug-in did:
+#   - removes the plug-in, the uninstaller app and the package receipts
+#   - removes the settings Core Audio saved for the plug-in and its device
+#   - re-enumerates the card, so the macOS driver gets it back exactly as after plugging
+#     it in (the plug-in leaves the card's byte alignment shifted, and the macOS driver
+#     would play loud noise through it)
+FTCONFIG=${FTCONFIG:-"$(dirname "$0")/ftconfig"}
+ID=com.github.nclr.fasttrack24
+UID_=FastTrack24_UID
+SYS=/Library/Preferences/Audio/com.apple.audio.SystemSettings.plist
+DEV=/Library/Preferences/Audio/com.apple.audio.DeviceSettings.plist
+PB=/usr/libexec/PlistBuddy
+
 rm -rf /Library/Audio/Plug-Ins/HAL/FastTrack24.driver
 pkill -9 -f "Core Audio Driver \(FastTrack24.driver\)"
-killall coreaudiod
+
+# Drop our entries from Core Audio's settings. coreaudiod keeps them in memory and may
+# write them back, so edit while it is stopped for good: SIGKILL gives it no chance to
+# save, and launchd starts a fresh one that reads the edited files without the plug-in.
+forget_uid() { # plist key: remove array entries whose uid is ours
+  i=0
+  while uid=$($PB -c "Print ':preferred devices:$2:$i:uid'" "$1" 2>/dev/null); do
+    if [ "$uid" = "$UID_" ]; then
+      $PB -c "Delete ':preferred devices:$2:$i'" "$1"
+    else
+      i=$((i + 1))
+    fi
+  done
+}
+if [ -f "$SYS" ]; then
+  $PB -c "Delete ':Plug-In.$ID'" "$SYS" 2>/dev/null
+  $PB -c "Delete ':device.$UID_'" "$SYS" 2>/dev/null
+  for list in output 'system output'; do forget_uid "$SYS" "$list"; done
+fi
+[ -f "$DEV" ] && $PB -c "Delete ':$UID_'" "$DEV" 2>/dev/null
+killall -9 coreaudiod
+
 sleep 2
-"$(dirname "$0")/ftconfig" release
+"$FTCONFIG" reset
+
 rm -rf "/Applications/Utilities/Uninstall Fast Track Pro 24-bit.app"
-pkgutil --forget com.github.nclr.fasttrack24 >/dev/null 2>&1
-pkgutil --forget com.github.nclr.fasttrack24.uninstaller >/dev/null 2>&1
-pkgutil --forget com.github.nclr.fasttrack24.uninstall >/dev/null 2>&1
+pkgutil --forget "$ID" >/dev/null 2>&1
+pkgutil --forget "$ID.uninstaller" >/dev/null 2>&1
+pkgutil --forget "$ID.uninstall" >/dev/null 2>&1
 exit 0

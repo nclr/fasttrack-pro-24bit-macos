@@ -191,16 +191,21 @@ by `make pkg`, or from the Releases page), or from a clone of the repository run
 make uninstall
 ```
 
-Either way the plug-in is removed from `/Library/Audio/Plug-Ins/HAL`, Core Audio restarts
-and the card returns to USB configuration 1, so it is the normal 16-bit macOS device again.
-To do the same by hand:
+All three run the same script (`installer/scripts-uninstall/postinstall`), which undoes
+everything the installer and the plug-in did:
 
-```sh
-sudo rm -rf /Library/Audio/Plug-Ins/HAL/FastTrack24.driver
-sudo pkill -9 -f "Core Audio Driver \(FastTrack24.driver\)"   # the plug-in's helper process
-sudo killall coreaudiod
-make -C tools ftconfig && tools/ftconfig release   # or unplug and replug the card
-```
+- removes the plug-in from `/Library/Audio/Plug-Ins/HAL`, the uninstaller app and the
+  package receipts, and stops the plug-in's helper process
+- removes what Core Audio saved for the plug-in (volume, mute, sample rate) and for the
+  "Fast Track Pro 24-bit" device, including its place in the preferred output devices,
+  then restarts Core Audio
+- re-enumerates the card, as if it were unplugged and plugged in again. It comes back in
+  USB configuration 1 as the normal 16-bit macOS device, with its byte alignment reset:
+  only switching the configuration back would leave the alignment the plug-in left, and
+  the macOS driver would play loud noise.
+
+If the card is not plugged in while uninstalling, there is nothing to reset: it starts
+fresh the next time it is plugged in.
 
 ## License
 
