@@ -1,11 +1,14 @@
 #!/bin/sh
-# Runs as root from the uninstaller package (it installs no files).
+# Runs as root, from the uninstaller package (which installs no files) or from the
+# "Uninstall Fast Track Pro 24-bit" app, where it is bundled as uninstall.sh.
 # Remove the plug-in, stop it, and give the Fast Track Pro back to the macOS driver.
 rm -rf /Library/Audio/Plug-Ins/HAL/FastTrack24.driver
 pkill -9 -f "Core Audio Driver \(FastTrack24.driver\)"
 killall coreaudiod
 sleep 2
 "$(dirname "$0")/ftconfig" release
+rm -rf "/Applications/Utilities/Uninstall Fast Track Pro 24-bit.app"
 pkgutil --forget com.github.nclr.fasttrack24 >/dev/null 2>&1
+pkgutil --forget com.github.nclr.fasttrack24.uninstaller >/dev/null 2>&1
 pkgutil --forget com.github.nclr.fasttrack24.uninstall >/dev/null 2>&1
 exit 0

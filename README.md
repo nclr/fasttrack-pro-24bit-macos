@@ -20,6 +20,9 @@ password.
 3. Open **System Settings → Sound → Output** and select **Fast Track Pro 24-bit**.
    The regular "FastTrack Pro" entry disappears while the plug-in owns the card.
 
+The package also installs **Uninstall Fast Track Pro 24-bit** in Applications → Utilities
+(see [Uninstalling](#uninstalling)).
+
 The package is not signed with an Apple Developer ID, so macOS blocks it the first time if
 it was **downloaded**: it says it cannot verify the developer. Click **Done**, then open
 **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to the
@@ -137,14 +140,17 @@ Results with alt 2 at 48 kHz:
 
 ```
 driver/     Core Audio plug-in (FastTrack24.c), install/uninstall scripts, test host
-installer/  scripts and resources for the .pkg installer and uninstaller
+installer/  .pkg installer and uninstaller, and the uninstaller app
 tools/      diagnostics used to find the byte layout
 ```
 
 ## Uninstalling
 
-Double-click `Uninstall-FastTrack24-<version>.pkg` (built next to the installer by
-`make pkg`, or from the Releases page), or from a clone of the repository run:
+Open **Applications → Utilities → Uninstall Fast Track Pro 24-bit**, confirm and enter your
+password. It is installed by the package; it removes itself when done.
+
+Alternatively double-click `Uninstall-FastTrack24-<version>.pkg` (built next to the installer
+by `make pkg`, or from the Releases page), or from a clone of the repository run:
 
 ```sh
 make uninstall
