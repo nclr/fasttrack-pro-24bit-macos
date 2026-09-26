@@ -1,0 +1,9 @@
+# build output
+ft24/ft24
+tools/usbtone
+tools/ft-config2
+tools/desc
+tools/probe
+*.o
+*.dSYM/
+.DS_Store
