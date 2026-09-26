@@ -7,6 +7,7 @@
  *     HML/MHL/...: byte 0,1,2 carry the High/Mid/Low byte of each sample
  *     b0..b2: 8-bit tone in that byte of each 24-bit sample, other bytes zero
  *     alt 1 = 16-bit, alt 2 = 24-bit (adaptive), both 48 kHz
+ *   optional: interface (2 = outputs 1-2, 3 = outputs 3-4) and tone frequency in Hz
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -26,6 +27,7 @@ static int g_be;
 static const char *g_perm; /* e.g. "MHL": significance of byte 0,1,2 */
 static int g_bytepos = -1; /* 0..2: tone as 8-bit value in this byte only */
 static double g_phase;
+static double g_freq = 440.0;
 static double g_acc;      /* fractional sample accumulator for 44.1k-style rates */
 static UInt64 g_next_frame;
 static int g_remaining_ms;
@@ -63,7 +65,7 @@ static void fill(Xfer *x) {
         g_acc -= n;
         for (int i = 0; i < n; i++) {
             int32_t s = (int32_t)lrint(0.1 * sin(g_phase) * 8388607.0);
-            g_phase += 2 * M_PI * 440.0 / RATE;
+            g_phase += 2 * M_PI * g_freq / RATE;
             if (g_phase > 2 * M_PI) g_phase -= 2 * M_PI;
             put(p, s); p += g_bytes;
             put(p, s); p += g_bytes;
@@ -133,7 +135,9 @@ static io_service_t find_interface(int num) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { puts("usage: usbtone <alt 1|2> <be|le> <seconds>"); return 2; }
+    if (argc < 4) { puts("usage: usbtone <alt 1|2> <layout> <seconds> [interface 2|3] [Hz]"); return 2; }
+    int ifnum = argc > 4 ? atoi(argv[4]) : 2;
+    if (argc > 5) g_freq = atof(argv[5]);
     int alt = atoi(argv[1]);
     g_be = !strcmp(argv[2], "be");
     if (strlen(argv[2]) == 3 && strspn(argv[2], "HML") == 3) g_perm = argv[2];
@@ -141,8 +145,8 @@ int main(int argc, char **argv) {
     g_bytes = alt == 1 ? 2 : 3;
     g_remaining_ms = atoi(argv[3]) * 1000;
 
-    io_service_t svc = find_interface(2);
-    if (!svc) { puts("Interface 2 not found. Run: ftconfig claim"); return 1; }
+    io_service_t svc = find_interface(ifnum);
+    if (!svc) { printf("Interface %d not found. Run: ftconfig claim\n", ifnum); return 1; }
     IOCFPlugInInterface **plug; SInt32 score;
     kern_return_t kr = IOCreatePlugInInterfaceForService(svc, kIOUSBInterfaceUserClientTypeID, kIOCFPlugInInterfaceID, &plug, &score);
     IOObjectRelease(svc);
@@ -151,29 +155,29 @@ int main(int argc, char **argv) {
     (*plug)->Release(plug);
 
     IOReturn r = (*g_intf)->USBInterfaceOpenSeize(g_intf);
-    printf("seize interface 2: 0x%x\n", r);
+    printf("seize interface %d: 0x%x\n", ifnum, r);
     if (r) return 1;
 
     r = (*g_intf)->SetAlternateInterface(g_intf, (UInt8)alt);
     printf("alt %d: 0x%x\n", alt, r);
 
-    UInt8 nep = 0;
+    UInt8 nep = 0, epnum = 0;
     (*g_intf)->GetNumEndpoints(g_intf, &nep);
     for (UInt8 i = 1; i <= nep; i++) {
         UInt8 dir, num, type, interval; UInt16 mps;
         (*g_intf)->GetPipeProperties(g_intf, i, &dir, &num, &type, &mps, &interval);
         printf("pipe %u: ep %u dir %u type %u maxpkt %u\n", i, num, dir, type, mps);
-        if (dir == kUSBOut && type == kUSBIsoc) g_pipe = i;
+        if (dir == kUSBOut && type == kUSBIsoc) { g_pipe = i; epnum = num; }
     }
     if (!g_pipe) { puts("no iso OUT pipe"); goto out; }
 
-    /* UAC1 SET_CUR SAMPLING_FREQ on endpoint 0x03 */
+    /* UAC1 SET_CUR SAMPLING_FREQ on the OUT endpoint */
     UInt8 rate[3] = {RATE & 0xff, (RATE >> 8) & 0xff, (RATE >> 16) & 0xff};
     IOUSBDevRequest req = {
         .bmRequestType = USBmakebmRequestType(kUSBOut, kUSBClass, kUSBEndpoint),
-        .bRequest = 0x01, .wValue = 0x0100, .wIndex = 0x03, .wLength = 3, .pData = rate};
+        .bRequest = 0x01, .wValue = 0x0100, .wIndex = epnum, .wLength = 3, .pData = rate};
     r = (*g_intf)->ControlRequest(g_intf, 0, &req);
-    printf("set rate %d: 0x%x\n", RATE, r);
+    printf("set rate %d on endpoint %u: 0x%x\n", RATE, epnum, r);
 
     CFRunLoopSourceRef src;
     (*g_intf)->CreateInterfaceAsyncEventSource(g_intf, &src);

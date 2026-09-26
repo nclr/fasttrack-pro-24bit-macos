@@ -4,6 +4,7 @@
  *   ftconfig claim     configuration 2 (24-bit alt settings) with interface matching off,
  *                      so the macOS driver stays detached and tools can drive the card
  *   ftconfig release   configuration 1 with matching on: the normal 16-bit macOS device
+ *   ftconfig claim1    configuration 1 with matching off (16-bit class-compliant mode, for tests)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -14,9 +15,9 @@
 
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : "";
-    int claim = !strcmp(cmd, "claim"), release = !strcmp(cmd, "release"), status = !strcmp(cmd, "status");
-    if (!claim && !release && !status) {
-        fprintf(stderr, "usage: ftconfig status|claim|release\n");
+    int claim = !strcmp(cmd, "claim"), claim1 = !strcmp(cmd, "claim1"), release = !strcmp(cmd, "release"), status = !strcmp(cmd, "status");
+    if (!claim && !claim1 && !release && !status) {
+        fprintf(stderr, "usage: ftconfig status|claim|claim1|release\n");
         return 2;
     }
 
@@ -62,6 +63,9 @@ int main(int argc, char **argv) {
         if (claim) {
             (*dev)->SetConfigurationV2(dev, 1, false, false);
             r = (*dev)->SetConfigurationV2(dev, 2, false, false);
+        } else if (claim1) {
+            (*dev)->SetConfigurationV2(dev, 2, false, false);
+            r = (*dev)->SetConfigurationV2(dev, 1, false, false);
         } else {
             r = (*dev)->SetConfigurationV2(dev, 1, true, false);
         }
@@ -73,6 +77,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed: 0x%x\n", r);
         return 1;
     }
-    printf("configuration %u, macOS driver %s\n", cfg, claim ? "detached" : "attached");
+    printf("configuration %u, macOS driver %s\n", cfg, claim || claim1 ? "detached" : "attached");
     return 0;
 }

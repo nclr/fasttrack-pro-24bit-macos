@@ -8,6 +8,10 @@
  *
  *   apps -> "Fast Track Pro 24-bit" (this plug-in) -> USB isochronous -> outputs 1-2, 3-4
  *
+ * The device has two output streams like the card itself: channels 1-2 (interface 2, the
+ * headphone jack with the A/B button out) and 3-4 (interface 3, S/PDIF out and the
+ * headphone jack with the button in).
+ *
  * Device clock: host time at the nominal rate (like any virtual device). The card's
  * 24-bit endpoints are adaptive, so the USB thread sends 44-45 / 47-49 samples per 1 ms
  * frame to follow a FIFO fill target instead of resampling. Samples pass through
@@ -38,6 +42,7 @@ enum {
     kObjStream = 3,
     kObjVolume = 4,
     kObjMute = 5,
+    kObjStream2 = 6,
 };
 
 #define kDeviceUID "FastTrack24_UID"
@@ -55,6 +60,7 @@ enum {
     NSLOT = 8,             /* transfers queued: 32 ms */
     MAX_PER_MS = 49,
     NIF = 2,
+    NOUT = 4,              /* output channels: 1-2 on interface 2, 3-4 on interface 3 */
 };
 static const int OUT_IFACES[NIF] = {2, 3};
 static const Float64 RATES[] = {44100.0, 48000.0};
@@ -79,21 +85,23 @@ static UInt64 g_anchor;
 static UInt64 g_ts_count;
 static Float64 g_host_ticks_per_sec;
 
-#pragma mark - FIFO: HAL IO thread -> USB thread
+#pragma mark - Output ring: HAL IO thread -> USB thread
 
-static float g_ringL[RING], g_ringR[RING];
-static _Atomic uint64_t g_w, g_r;
+/* Indexed by device sample time, so the two output streams stay sample-aligned. g_head is
+ * one past the newest sample time written; the USB thread reads behind it and clears what
+ * it has read. g_epoch changes when IO restarts, because sample time starts over. */
+static float g_ring[RING][NOUT];
+static _Atomic int64_t g_head;
+static _Atomic unsigned g_epoch;
 
-static void fifo_push(const float *interleaved, UInt32 n, float gain) {
-    uint64_t w = atomic_load_explicit(&g_w, memory_order_relaxed);
-    uint64_t r = atomic_load_explicit(&g_r, memory_order_acquire);
-    uint64_t space = RING - 1 - (w - r);
-    if (n > space) n = (UInt32)space;
+static void ring_write(int64_t t, const float *in, UInt32 n, int ch0, float gain) {
     for (UInt32 i = 0; i < n; i++) {
-        g_ringL[(w + i) & (RING - 1)] = interleaved[i * NCH] * gain;
-        g_ringR[(w + i) & (RING - 1)] = interleaved[i * NCH + 1] * gain;
+        float *f = g_ring[(t + i) & (RING - 1)];
+        f[ch0] = in[i * 2] * gain;
+        f[ch0 + 1] = in[i * 2 + 1] * gain;
     }
-    atomic_store_explicit(&g_w, w + n, memory_order_release);
+    int64_t end = t + n, h = atomic_load_explicit(&g_head, memory_order_relaxed);
+    while (end > h && !atomic_compare_exchange_weak_explicit(&g_head, &h, end, memory_order_release, memory_order_relaxed)) {}
 }
 
 #pragma mark - USB streaming (runs on the USB thread's run loop)
@@ -130,6 +138,8 @@ static StopReason g_stop_reason;
 static Float64 g_stream_rate;
 static UInt64 g_next_frame;
 static double g_acc, g_fill_lp;
+static int64_t g_rpos;
+static unsigned g_seen_epoch;
 static int g_primed, g_inflight, g_parked, g_claim_tries;
 static unsigned g_underruns, g_usb_errors, g_retries, g_gaps;
 
@@ -150,15 +160,18 @@ static void set_present(int present) {
 }
 
 static void fill_slot(Slot *s) {
-    uint64_t w = atomic_load_explicit(&g_w, memory_order_acquire);
-    uint64_t r = atomic_load_explicit(&g_r, memory_order_relaxed);
-    uint64_t fill = w - r;
-    if (!g_primed && fill >= TARGET) {
-        r = w - TARGET;
-        fill = TARGET;
+    int64_t head = atomic_load_explicit(&g_head, memory_order_acquire);
+    unsigned epoch = atomic_load(&g_epoch);
+    if (epoch != g_seen_epoch) { /* IO restarted: sample time starts over */
+        g_seen_epoch = epoch;
+        g_primed = 0;
+    }
+    if (!g_primed && head >= TARGET) {
+        g_rpos = head - TARGET;
         g_primed = 1;
     }
-    g_fill_lp += 0.02 * ((double)fill - g_fill_lp);
+    double fill = g_primed ? (double)(head - g_rpos) : TARGET;
+    g_fill_lp += 0.02 * (fill - g_fill_lp);
     double corr = (g_fill_lp - TARGET) / TARGET * 0.002;
     if (corr > 0.001) corr = 0.001;
     if (corr < -0.001) corr = -0.001;
@@ -171,21 +184,20 @@ static void fill_slot(Slot *s) {
         g_acc -= n;
         if (n > MAX_PER_MS) n = MAX_PER_MS;
         for (int i = 0; i < n; i++) {
-            float L = 0, R = 0;
-            if (g_primed && r < w) {
-                L = g_ringL[r & (RING - 1)];
-                R = g_ringR[r & (RING - 1)];
-                r++;
+            float frame[NOUT] = {0};
+            if (g_primed && g_rpos < head) {
+                float *src = g_ring[g_rpos & (RING - 1)];
+                memcpy(frame, src, sizeof frame);
+                memset(src, 0, sizeof frame);
+                g_rpos++;
             } else if (g_primed) {
                 g_primed = 0; /* ran dry: output silence until TARGET is buffered again */
-                if (atomic_load(&g_w) != 0) g_underruns++;
+                g_underruns++;
             }
-            uint8_t frame[6];
-            put24(frame, L);
-            put24(frame + 3, R);
             for (int k = 0; k < NIF; k++) {
                 if (!g_if[k]) continue;
-                memcpy(dst[k], frame, 6);
+                put24(dst[k], frame[2 * k]);
+                put24(dst[k] + 3, frame[2 * k + 1]);
                 dst[k] += 6;
             }
         }
@@ -195,7 +207,6 @@ static void fill_slot(Slot *s) {
             s->fl[k][f].frStatus = 0;
         }
     }
-    atomic_store_explicit(&g_r, r, memory_order_release);
 }
 
 static void submit(Slot *s);
@@ -308,9 +319,9 @@ static void on_done(void *refcon, IOReturn result, void *arg0) {
 
 static void submit(Slot *s) {
     UInt64 bus = bus_frame();
-    if (g_next_frame < bus + 2) { /* fell behind the bus: skip ahead, leaving a gap */
+    if (g_next_frame < bus + 4) { /* fell behind the bus: skip ahead, leaving a gap */
         g_gaps++;
-        g_next_frame = bus + 2;
+        g_next_frame = bus + 8;
     }
     fill_slot(s);
     s->frame = g_next_frame;
@@ -354,7 +365,7 @@ static void start_stream(void) {
     g_acc = 0;
     g_fill_lp = TARGET;
     g_primed = 0;
-    g_next_frame = bus_frame() + 4;
+    g_next_frame = bus_frame() + 16; /* first submissions can be slow: leave headroom */
     g_state = ST_STREAMING;
     for (int i = 0; i < NSLOT && g_state == ST_STREAMING; i++) submit(&g_slot[i]);
     LOG("streaming 24-bit / %.0f Hz", g_stream_rate);
@@ -724,8 +735,8 @@ static OSStatus get_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a,
         case kAudioObjectPropertyName: PUT(CFStringRef, CFSTR(kDeviceName));
         case kAudioObjectPropertyManufacturer: PUT(CFStringRef, CFSTR(kManufacturer));
         case kAudioObjectPropertyOwnedObjects: {
-            AudioObjectID o[3] = {kObjStream, kObjVolume, kObjMute};
-            PUT_ARRAY(AudioObjectID, o, outScope ? 3 : 0);
+            AudioObjectID o[4] = {kObjStream, kObjStream2, kObjVolume, kObjMute};
+            PUT_ARRAY(AudioObjectID, o, outScope ? 4 : 0);
         }
         case kAudioObjectPropertyControlList: {
             AudioObjectID o[2] = {kObjVolume, kObjMute};
@@ -751,8 +762,8 @@ static OSStatus get_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a,
         case kAudioDevicePropertyLatency: PUT(UInt32, outScope ? latency_frames() : 0);
         case kAudioDevicePropertySafetyOffset: PUT(UInt32, 0);
         case kAudioDevicePropertyStreams: {
-            AudioObjectID st = kObjStream;
-            PUT_ARRAY(AudioObjectID, &st, outScope ? 1 : 0);
+            AudioObjectID st[2] = {kObjStream, kObjStream2};
+            PUT_ARRAY(AudioObjectID, st, outScope ? 2 : 0);
         }
         case kAudioDevicePropertyNominalSampleRate: PUT(Float64, atomic_load(&g_rate));
         case kAudioDevicePropertyAvailableNominalSampleRates: {
@@ -767,23 +778,31 @@ static OSStatus get_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a,
             PUT_ARRAY(UInt32, ch, 2);
         }
         case kAudioDevicePropertyPreferredChannelLayout: {
-            AudioChannelLayout l = {.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo};
+            AudioChannelLayout l = {.mChannelLayoutTag = kAudioChannelLayoutTag_DiscreteInOrder | NOUT};
             PUT(AudioChannelLayout, l);
+        }
+        case kAudioObjectPropertyElementName: {
+            static const CFStringRef names[NOUT] = {CFSTR("Output 1"), CFSTR("Output 2"), CFSTR("Output 3"), CFSTR("Output 4")};
+            if (!outScope || a->mElement < 1 || a->mElement > NOUT) break;
+            PUT(CFStringRef, names[a->mElement - 1]);
         }
         }
         break;
     }
 
     case kObjStream:
+    case kObjStream2:
         switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass: PUT(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: PUT(AudioClassID, kAudioStreamClassID);
+        case kAudioObjectPropertyName:
+            PUT(CFStringRef, obj == kObjStream ? CFSTR("Outputs 1-2 (headphones A)") : CFSTR("Outputs 3-4 (headphones B, S/PDIF)"));
         case kAudioObjectPropertyOwner: PUT(AudioObjectID, kObjDevice);
         case kAudioObjectPropertyOwnedObjects: PUT_ARRAY(AudioObjectID, NULL, 0);
         case kAudioStreamPropertyIsActive: PUT(UInt32, 1);
         case kAudioStreamPropertyDirection: PUT(UInt32, 0); /* output */
         case kAudioStreamPropertyTerminalType: PUT(UInt32, kAudioStreamTerminalTypeLine);
-        case kAudioStreamPropertyStartingChannel: PUT(UInt32, 1);
+        case kAudioStreamPropertyStartingChannel: PUT(UInt32, obj == kObjStream ? 1 : 3);
         case kAudioStreamPropertyLatency: PUT(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat:
         case kAudioStreamPropertyPhysicalFormat: PUT(AudioStreamBasicDescription, format_at(atomic_load(&g_rate)));
@@ -842,6 +861,7 @@ static int settable(AudioObjectID obj, AudioObjectPropertySelector sel) {
     switch (obj) {
     case kObjDevice: return sel == kAudioDevicePropertyNominalSampleRate;
     case kObjStream:
+    case kObjStream2:
         return sel == kAudioStreamPropertyVirtualFormat || sel == kAudioStreamPropertyPhysicalFormat ||
                sel == kAudioStreamPropertyIsActive;
     case kObjVolume: return sel == kAudioLevelControlPropertyScalarValue || sel == kAudioLevelControlPropertyDecibelValue;
@@ -984,6 +1004,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
         if (inSize != sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
         return request_rate(*(const Float64 *)in);
     case kObjStream:
+    case kObjStream2:
         if (a->mSelector == kAudioStreamPropertyIsActive) return 0;
         if (inSize != sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
         {
@@ -1024,6 +1045,9 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
     if (g_io_clients++ == 0) {
         g_anchor = mach_absolute_time();
         g_ts_count = 0;
+        memset(g_ring, 0, sizeof g_ring);
+        atomic_store(&g_head, 0);
+        atomic_fetch_add(&g_epoch, 1);
     }
     pthread_mutex_unlock(&g_mutex);
     return 0;
@@ -1067,11 +1091,11 @@ static OSStatus BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev
 
 static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, AudioObjectID stream, UInt32 client, UInt32 op,
                               UInt32 frames, const AudioServerPlugInIOCycleInfo *info, void *main, void *secondary) {
-    (void)d; (void)dev; (void)stream; (void)client; (void)info; (void)secondary;
-    if (op == kAudioServerPlugInIOOperationWriteMix && main) {
+    (void)d; (void)dev; (void)client; (void)secondary;
+    if (op == kAudioServerPlugInIOOperationWriteMix && main && info) {
         float gain = atomic_load(&g_mute) ? 0.0f : atomic_load(&g_volume);
         gain *= gain; /* scalar^2, exactly 1.0 at full volume: bit-perfect */
-        fifo_push(main, frames, gain);
+        ring_write((int64_t)llround(info->mOutputTime.mSampleTime), main, frames, stream == kObjStream2 ? 2 : 0, gain);
     }
     return 0;
 }

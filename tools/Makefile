@@ -1,8 +1,8 @@
 FW = -framework IOKit -framework CoreFoundation
-all: usbtone ftconfig desc probe
-usbtone ftconfig desc: %: %.c
+all: usbtone usbrec ftconfig desc probe carec
+usbtone usbrec ftconfig desc: %: %.c
 	clang -O2 -Wall -o $@ $< $(FW)
-probe: probe.c
+probe carec: %: %.c
 	clang -O2 -Wall -o $@ $< -framework CoreAudio -framework CoreFoundation
 clean:
-	rm -f usbtone ftconfig desc probe
+	rm -f usbtone usbrec ftconfig desc probe carec

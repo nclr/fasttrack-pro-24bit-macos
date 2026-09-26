@@ -10,14 +10,19 @@ $(BUNDLE): FastTrack24.c Info.plist
 	@touch $(BUNDLE)
 
 clean:
-	rm -rf $(BUNDLE) testhost
+	rm -rf $(BUNDLE) $(TESTHOST)
 
 # Load the plug-in outside coreaudiod and exercise it (claims the card, streams silence).
-test: $(BUNDLE) testhost ../tools/ftconfig
-	./testhost $(BUNDLE)
+# The test host lives in ../build: CFBundle will not open a bundle that sits next to the
+# executable loading it.
+TESTHOST = ../build/testhost
+
+test: $(BUNDLE) $(TESTHOST) ../tools/ftconfig
+	$(TESTHOST) $(BUNDLE)
 	../tools/ftconfig release
 
-testhost: testhost.c
+$(TESTHOST): testhost.c
+	mkdir -p ../build
 	clang -O2 -Wall -o $@ $< -framework CoreAudio -framework CoreFoundation
 
 ../tools/ftconfig:

@@ -51,6 +51,7 @@ Optional checks:
 
 ```sh
 make test       # loads the plug-in outside coreaudiod and streams silence (do this before installing)
+FT_TONE=1 make -C driver test   # same, with 440 Hz on outputs 1-2 and 660 Hz on 3-4
 /usr/bin/log stream --predicate 'subsystem == "com.github.nclr.fasttrack24"'   # live plug-in log
 ```
 
@@ -87,10 +88,22 @@ formats, refuses integer virtual formats and does not allow mixing to be disable
 apps -> "Fast Track Pro 24-bit" (plug-in) -> USB isochronous -> Fast Track Pro outputs 1-2 and 3-4
 ```
 
+The card has two independent stereo outputs, and the device shows both:
+
+| Channels | Stream | USB interface | Where it comes out |
+|----------|--------|---------------|--------------------|
+| 1–2 | Outputs 1-2 (headphones A) | 2 | main outputs 1–2; headphones with the A/B button **out** |
+| 3–4 | Outputs 3-4 (headphones B, S/PDIF) | 3 | outputs 3–4 and S/PDIF out; headphones with the A/B button **in** |
+
+Ordinary apps (Music, browsers, system sounds) play on channels 1–2. A DAW can send a
+separate mix, such as a cue or monitor mix, to channels 3–4. The A/B button chooses which
+of the two the headphones hear.
+
 1. When the card is plugged in, the plug-in re-selects USB configuration 2 with
    interface matching off, so the macOS driver (`usbaudiod`) does not attach.
 2. It opens output interfaces 2 and 3, selects alt 2 and sets the endpoint sample rate.
-3. Audio from the mix is converted from float to 24-bit in the card's byte order and
+3. Each output stream is written into a ring indexed by sample time, so the two pairs stay
+   sample-aligned. Audio is converted from float to 24-bit in the card's byte order and
    streamed with isochronous writes. The endpoints are adaptive, so instead of
    resampling the plug-in sends 44–45 or 47–49 samples per 1 ms USB frame to follow the
    device clock. At full volume samples pass through unaltered.
@@ -102,13 +115,16 @@ Features:
 - 24-bit at **44.1 kHz and 48 kHz** (set in Audio MIDI Setup or by the playing app)
 - Volume and mute controls, so the keyboard volume keys work. Full volume is bit-perfect.
 - Reports its latency (about 50 ms) to Core Audio, so video stays in sync
-- Both output pairs get the same stereo signal, so the headphone jack works with the
-  front-panel A/B button in either position
+- Four outputs as two streams, with channel names ("Output 1" … "Output 4") for DAWs
 - No virtual loopback device (such as BlackHole), no background app, no microphone permission
 
 Limitations:
 
-- Playback only: the card's inputs and MIDI are unavailable while the plug-in owns it
+- Playback only. The card's inputs are not supported: on the card this was developed with,
+  they send corrupted data (near full-scale values made of one repeated byte) with nothing
+  plugged in, even through Apple's own driver in the standard 16-bit mode, so there was
+  nothing valid to build on. `tools/usbrec` and `tools/carec` reproduce the test.
+- MIDI is unavailable while the plug-in owns the card
 - The 88.2/96 kHz mode (alt 3) is untested and not offered
 - Audio MIDI Setup shows the stream as 32-bit float: that is the mix format Core Audio
   hands to the plug-in; the card receives 24-bit integers
@@ -122,8 +138,11 @@ both would claim the card.
 |------|---------|
 | `probe` | Lists Core Audio devices, streams and formats |
 | `desc` | Dumps the card's USB configuration descriptors |
-| `ftconfig status\|claim\|release` | Show the USB configuration, detach the macOS driver (configuration 2), or give the card back (configuration 1) |
-| `usbtone <alt> <layout> <seconds>` | Byte-exact tone on interface 2 |
+| `ftconfig status\|claim\|claim1\|release` | Show the USB configuration, detach the macOS driver (configuration 2, or 1 with `claim1`), or give the card back (configuration 1) |
+| `usbtone <alt> <layout> <seconds> [interface] [Hz]` | Byte-exact tone on interface 2 (outputs 1–2) or 3 (outputs 3–4) |
+| `usbrec <interface> <seconds> [file] [alt]` | Raw capture from input interface 4 or 5, with a byte-layout smoothness check |
+| `carec <seconds>` | Records the inputs through the macOS driver and reports level and repeated-byte samples |
+| `session.sh` | A/B button test (440 Hz on outputs 1–2, 660 Hz on 3–4), then a `carec` recording |
 | `usbdiag.sh` | 16-bit LE/BE controls vs 24-bit LE/BE |
 | `bytediag.sh` | 8-bit tone in one byte position at a time |
 | `permdiag.sh` | Full 24-bit tone in `MHL` vs `HML` layout |
@@ -135,6 +154,8 @@ Results with alt 2 at 48 kHz:
 - Tone in byte 0 only: audible. Byte 1 only: louder. Byte 2 only: silence.
   So byte 1 is most significant, byte 0 middle, byte 2 least.
 - Full 24-bit tone as `[middle, high, low]`: clean.
+- 440 Hz on outputs 1–2 and 660 Hz on outputs 3–4 at the same time: the low tone with the
+  A/B button out, the high tone with it in.
 
 ## Repository layout
 

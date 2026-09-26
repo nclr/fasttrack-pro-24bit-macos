@@ -3,8 +3,9 @@ tools/usbtone
 tools/ftconfig
 tools/desc
 tools/probe
+tools/usbrec
+tools/carec
 driver/FastTrack24.driver/
-driver/testhost
 build/
 *.o
 *.dSYM/
