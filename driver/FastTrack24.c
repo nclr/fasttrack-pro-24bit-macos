@@ -1,9 +1,9 @@
 /* FastTrack24: Core Audio server plug-in giving the M-Audio Fast Track Pro a working
  * 24-bit output on macOS.
  *
- * The card's 24-bit alt settings take 3-byte samples as [high, low, middle], which the
- * macOS USB audio driver cannot produce. The card does not realign to sample boundaries,
- * so that order only holds from a fresh start: stray bytes (a transfer that is not whole
+ * The card's 24-bit alt settings take big-endian 3-byte samples, which the macOS USB
+ * audio driver cannot produce. The card does not realign to sample boundaries, so that
+ * order only holds from a fresh start: stray bytes (a transfer that is not whole
  * samples) shift it for good, until the card is powered up or re-enumerated again. This
  * plug-in runs inside coreaudiod, re-enumerates the card, detaches it from usbaudiod (USB
  * configuration 2 with interface matching off) and streams to output interfaces 2 and 3
@@ -113,9 +113,9 @@ static inline void put24(uint8_t *p, float x) {
     int32_t s = (int32_t)lrintf(x * 8388608.0f);
     if (s > 8388607) s = 8388607;
     if (s < -8388608) s = -8388608;
-    p[0] = (uint8_t)(s >> 16); /* high */
-    p[1] = (uint8_t)s;         /* low */
-    p[2] = (uint8_t)(s >> 8);  /* middle */
+    p[0] = (uint8_t)(s >> 16);
+    p[1] = (uint8_t)(s >> 8);
+    p[2] = (uint8_t)s;
 }
 
 typedef struct {

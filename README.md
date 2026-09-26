@@ -66,20 +66,21 @@ modes live in configuration 2. When macOS drives those modes, every 24-bit forma
 plays as harsh noise.
 
 The cause is the sample byte order. On output interfaces 2 and 3, alt setting 2
-(24-bit, 44.1/48 kHz, adaptive), a freshly powered-up card takes each 3-byte sample as:
+(24-bit, 44.1/48 kHz, adaptive), a freshly powered-up card takes each 3-byte sample
+big-endian:
 
 | byte 0 | byte 1 | byte 2 |
 |--------|--------|--------|
-| high   | low    | middle |
+| high   | middle | low    |
 
-That is neither little-endian (what macOS sends) nor big-endian (what the Linux
-`snd-usb-audio` quirk assumes for this card), and both of those play as noise. The layout
-was determined by ear with a byte-exact USB streamer, see [How it was found](#how-it-was-found).
+That is what the Linux `snd-usb-audio` quirk for this card uses (`S24_3BE`), while macOS
+sends little-endian. The layout was determined by ear with a byte-exact USB streamer, see
+[How it was found](#how-it-was-found).
 
-The card does not realign to sample boundaries. It behaves like little-endian read from
-the wrong starting byte, and a transfer that is not a whole number of samples shifts that
-starting byte for good: the order that plays clean changes and stays changed until the
-card is powered up or re-enumerated again. A single 1-byte transfer is enough.
+The card does not realign to sample boundaries. A transfer that is not a whole number of
+samples shifts the byte it starts a sample on, for good: the order that plays clean
+changes and stays changed until the card is powered up or re-enumerated again. A single
+1-byte transfer is enough.
 
 The macOS driver cannot be told to use this layout: it rejects big-endian physical
 formats, refuses integer virtual formats and does not allow mixing to be disabled.
@@ -152,22 +153,30 @@ both would claim the card.
 | `session.sh` | A/B button test (440 Hz on outputs 1–2, 660 Hz on 3–4), then a `carec` recording |
 | `usbdiag.sh` | 16-bit LE/BE controls vs 24-bit LE/BE |
 | `bytediag.sh` | 8-bit tone in one byte position at a time |
-| `permdiag.sh` | Resets the card, then plays a full 24-bit tone in each byte rotation (`HLM`, `MHL`, `LMH`) |
+| `permdiag.sh` | Resets the card, then plays a full 24-bit tone as big-endian (`HML`), with the middle and low bytes swapped (`HLM`), and little-endian (`LMH`) |
 
 Results with alt 2 at 48 kHz (the first ones on a card in an unknown state, see below):
 
 - 16-bit little-endian: clean tone; 16-bit big-endian: noise. The streamer is correct.
-- 24-bit little-endian and big-endian: both noise.
+- 24-bit little-endian and big-endian: both noise (on a card already shifted, see below).
 - Tone in byte 0 only: audible. Byte 1 only: louder. Byte 2 only: silence.
   So byte 1 is most significant, byte 0 middle, byte 2 least.
 - Full 24-bit tone as `[middle, high, low]`: clean.
 - After the card was unplugged and plugged in again, `[middle, high, low]` played as noise
-  and `[high, low, middle]` was clean, the same order read one byte later. That stayed
-  the same across configuration switches and stream restarts, and after every power-up
-  or re-enumeration (`ftconfig reset`). One 1-byte packet (`usbtone 2 HLM 4 2 440 1`)
-  turned it into noise for that and later streams until the next re-enumeration. So the
-  earlier sessions ran on a card that stray bytes had already shifted, probably from the
-  macOS 16-bit driver, whose 44.1 kHz packets (176 bytes) are not a multiple of 3.
+  and `[high, low, middle]` was clean. That stayed the same across configuration switches
+  and stream restarts, and after every power-up or re-enumeration (`ftconfig reset`). One
+  1-byte packet (`usbtone 2 HLM 4 2 440 1`) turned it into noise for that and later
+  streams until the next re-enumeration. So the earlier sessions ran on a card that stray
+  bytes had already shifted, probably from the macOS 16-bit driver, whose 44.1 kHz packets
+  (176 bytes) are not a multiple of 3.
+- Plug-in 1.2 and 1.3 sent `[high, low, middle]`. Loud music had a faint hiss that stopped
+  in silence: with the middle and low bytes swapped, the error is the random low byte
+  moved up 8 bits, about 50 dB below full scale. Speech with only the low byte (about
+  −97 dBFS) came out as a quiet, clear voice, and speech with only the middle byte came
+  out loud and noisy. The same chord sent `[high, low, middle]` and big-endian: the first
+  hissed, big-endian was clean. So the card is big-endian from power-up, and every by-ear
+  test above mixed up the middle and low bytes, which differ by only 48 dB and are easy
+  to confuse with a tone or at normal volume. The early big-endian test ran on a shifted card.
 - 440 Hz on outputs 1–2 and 660 Hz on outputs 3–4 at the same time: the low tone with the
   A/B button out, the high tone with it in.
 

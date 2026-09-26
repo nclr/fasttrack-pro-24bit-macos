@@ -10,8 +10,8 @@ echo "Press the A/B button a few times and note which tone you hear in each posi
 sleep 3
 "$D/ftconfig" claim >/dev/null || exit 1
 sleep 1
-"$D/usbtone" 2 HLM 15 2 440 >/dev/null &
-"$D/usbtone" 2 HLM 15 3 660 >/dev/null &
+"$D/usbtone" 2 HML 15 2 440 >/dev/null &
+"$D/usbtone" 2 HML 15 3 660 >/dev/null &
 wait
 echo
 echo "=== Part 2: recording through the macOS driver ==="
