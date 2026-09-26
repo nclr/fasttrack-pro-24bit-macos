@@ -109,5 +109,17 @@ EOF
 productbuild --quiet --distribution "$W/udist.xml" --resources "$W/ures" --package-path "$W/upkgs" \
   "$OUT/Uninstall-FastTrack24-$VERSION.pkg"
 
+# The flat-package archive records the owner (user name, uid) of every file in it, which
+# would publish the builder's account name. Re-pack both packages without owner fields.
+scrub() {
+  local x="$W/scrub"
+  rm -rf "$x" && mkdir -p "$x"
+  (cd "$x" && xar -x -f "$1" &&
+    xar --compression none --prop-exclude user --prop-exclude group --prop-exclude uid --prop-exclude gid \
+      -cf "$1.tmp" -- *) && mv "$1.tmp" "$1"
+}
+scrub "$OUT/FastTrack24-$VERSION.pkg"
+scrub "$OUT/Uninstall-FastTrack24-$VERSION.pkg"
+
 echo "Built:"
 ls -1 "$OUT"/*"$VERSION".pkg
