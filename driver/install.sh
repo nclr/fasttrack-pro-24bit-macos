@@ -3,10 +3,6 @@
 set -euo pipefail
 D=$(cd "$(dirname "$0")" && pwd)
 make -C "$D"
-if pgrep -xq ft24; then
-  echo "Stop the ft24 command-line player first (Ctrl-C in its window)."
-  exit 1
-fi
 echo "Installing to /Library/Audio/Plug-Ins/HAL. macOS will ask for your password."
 # The plug-in runs in its own helper process, which can outlive coreaudiod for a few
 # seconds. Remember the old one so it can be stopped without touching the new one.

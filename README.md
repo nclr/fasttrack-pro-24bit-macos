@@ -52,7 +52,7 @@ Features:
 - Reports its latency (about 50 ms) to Core Audio, so video stays in sync
 - Both output pairs get the same stereo signal, so the headphone jack works with the
   front-panel A/B button in either position
-- No virtual loopback device, no background app, no microphone permission
+- No virtual loopback device (such as BlackHole), no background app, no microphone permission
 
 Limitations:
 
@@ -61,23 +61,10 @@ Limitations:
 - Audio MIDI Setup shows the stream as 32-bit float: that is the mix format Core Audio
   hands to the plug-in; the card receives 24-bit integers
 
-## Alternative: the `ft24` command-line player
-
-`ft24/` is the first version of the same idea as a user-space program, with no
-installation. It reads from [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole)
-and streams to the card until you press Ctrl-C. It needs BlackHole installed and
-Microphone permission for the terminal app (macOS delivers silence from every input
-device without it). Don't run it while the plug-in is installed; both would claim the card.
-
-```sh
-make -C ft24
-./ft24/ft24            # Ctrl-C gives the card back to macOS
-./ft24/ft24 --a-only   # outputs 1-2 only
-```
-
 ## How it was found
 
-The tools in `tools/` drive the card directly:
+The tools in `tools/` drive the card directly. Uninstall the plug-in before using them:
+both would claim the card.
 
 | Tool | Purpose |
 |------|---------|
@@ -101,7 +88,6 @@ Results with alt 2 at 48 kHz:
 
 ```
 driver/   Core Audio plug-in (FastTrack24.c), install/uninstall scripts, test host
-ft24/     command-line player (BlackHole 2ch -> card)
 tools/    diagnostics used to find the byte layout
 ```
 
@@ -122,7 +108,7 @@ Build and install:
 ```sh
 git clone https://github.com/nclr/fasttrack-pro-24bit-macos.git
 cd fasttrack-pro-24bit-macos
-make            # builds driver/FastTrack24.driver, ft24/ft24 and tools/
+make            # builds driver/FastTrack24.driver and tools/
 make install    # copies the plug-in and restarts Core Audio (asks for your password)
 ```
 
@@ -138,6 +124,10 @@ make test       # loads the plug-in outside coreaudiod and streams silence (do t
 /usr/bin/log stream --predicate 'subsystem == "com.github.nclr.fasttrack24"'   # live plug-in log
 ```
 
+The plug-in logs a health line 30 s after it starts streaming and afterwards only when
+something goes wrong. Healthy playback looks like
+`last 30 s: 0 retries, 0 gaps, 0 underruns, 0 errors`.
+
 ## Uninstalling
 
 ```sh
@@ -150,6 +140,7 @@ To do the same by hand:
 
 ```sh
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/FastTrack24.driver
+sudo pkill -9 -f "Core Audio Driver \(FastTrack24.driver\)"   # the plug-in's helper process
 sudo killall coreaudiod
 make -C tools ftconfig && tools/ftconfig release   # or unplug and replug the card
 ```
