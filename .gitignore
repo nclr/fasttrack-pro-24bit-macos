@@ -5,6 +5,7 @@ tools/desc
 tools/probe
 driver/FastTrack24.driver/
 driver/testhost
+build/
 *.o
 *.dSYM/
 .DS_Store

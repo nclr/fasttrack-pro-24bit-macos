@@ -8,30 +8,46 @@ Select it in System Settings like any other sound output.
 
 ## Building and installing
 
-Requirements:
+Requirements: a Mac with macOS 12 or later (Apple silicon or Intel) and an administrator
+password.
 
-- A Mac with macOS 12 or later (Apple silicon or Intel)
-- Xcode command line tools: `xcode-select --install`
-- An administrator password (the plug-in installs into `/Library/Audio/Plug-Ins/HAL`)
+### Installer package (double-click)
 
-Build and install:
+1. Get `FastTrack24-<version>.pkg`: download it from the repository's Releases page, or
+   build it yourself (see below).
+2. Double-click it and follow the steps. Sound stops for a few seconds at the end while
+   Core Audio restarts.
+3. Open **System Settings → Sound → Output** and select **Fast Track Pro 24-bit**.
+   The regular "FastTrack Pro" entry disappears while the plug-in owns the card.
+
+The package is not signed with an Apple Developer ID, so macOS blocks it the first time if
+it was **downloaded**: it says it cannot verify the developer. Click **Done**, then open
+**System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to the
+message about `FastTrack24-<version>.pkg`. A package you built on the same Mac opens directly.
+
+### Building from source
+
+Install the Xcode command line tools once with `xcode-select --install`, then:
 
 ```sh
 git clone https://github.com/nclr/fasttrack-pro-24bit-macos.git
 cd fasttrack-pro-24bit-macos
+make pkg        # builds build/FastTrack24-<version>.pkg and build/Uninstall-FastTrack24-<version>.pkg
+```
+
+Double-click the package in `build/`, or install straight from the terminal instead:
+
+```sh
 make            # builds driver/FastTrack24.driver and tools/
 make install    # copies the plug-in and restarts Core Audio (asks for your password)
 ```
-
-Then open **System Settings → Sound → Output** and select **Fast Track Pro 24-bit**.
-The regular "FastTrack Pro" entry disappears while the plug-in owns the card.
 
 The plug-in is ad-hoc signed during the build; no Apple developer account is needed.
 
 Optional checks:
 
 ```sh
-make test       # loads the plug-in outside coreaudiod and streams silence (do this before `make install`)
+make test       # loads the plug-in outside coreaudiod and streams silence (do this before installing)
 /usr/bin/log stream --predicate 'subsystem == "com.github.nclr.fasttrack24"'   # live plug-in log
 ```
 
@@ -120,18 +136,22 @@ Results with alt 2 at 48 kHz:
 ## Repository layout
 
 ```
-driver/   Core Audio plug-in (FastTrack24.c), install/uninstall scripts, test host
-tools/    diagnostics used to find the byte layout
+driver/     Core Audio plug-in (FastTrack24.c), install/uninstall scripts, test host
+installer/  scripts and resources for the .pkg installer and uninstaller
+tools/      diagnostics used to find the byte layout
 ```
 
 ## Uninstalling
+
+Double-click `Uninstall-FastTrack24-<version>.pkg` (built next to the installer by
+`make pkg`, or from the Releases page), or from a clone of the repository run:
 
 ```sh
 make uninstall
 ```
 
-This removes `/Library/Audio/Plug-Ins/HAL/FastTrack24.driver`, restarts Core Audio and
-returns the card to USB configuration 1, so it is the normal 16-bit macOS device again.
+Either way the plug-in is removed from `/Library/Audio/Plug-Ins/HAL`, Core Audio restarts
+and the card returns to USB configuration 1, so it is the normal 16-bit macOS device again.
 To do the same by hand:
 
 ```sh

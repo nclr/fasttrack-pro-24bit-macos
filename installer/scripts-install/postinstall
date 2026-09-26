@@ -1,0 +1,8 @@
+#!/bin/sh
+# Runs as root after FastTrack24.driver is copied to /Library/Audio/Plug-Ins/HAL.
+# Restart Core Audio so it loads the plug-in. The previous version's helper process can
+# outlive coreaudiod for a few seconds and fight the new one over the card, so kill it in
+# the same step (coreaudiod has not loaded the new version yet, so any helper is old).
+pkill -9 -f "Core Audio Driver \(FastTrack24.driver\)"
+killall coreaudiod
+exit 0
