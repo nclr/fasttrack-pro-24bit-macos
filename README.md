@@ -3,6 +3,9 @@
 24-bit playback for the **M-Audio Fast Track Pro** (USB `0763:2012`) on macOS, where
 the built-in USB audio driver only produces loud static in 24-bit mode.
 
+It installs a Core Audio plug-in that adds a **"Fast Track Pro 24-bit"** output device.
+Select it in System Settings like any other sound output.
+
 ## The problem
 
 The Fast Track Pro boots in USB configuration 1 (16-bit, class compliant). Its 24-bit
@@ -10,90 +13,77 @@ modes live in configuration 2. When macOS drives those modes, every 24-bit forma
 plays as harsh noise.
 
 The cause is the sample byte order. On output interfaces 2 and 3, alt setting 2
-(24-bit, 48 kHz, adaptive), each 3-byte sample is laid out as:
+(24-bit, 44.1/48 kHz, adaptive), each 3-byte sample is laid out as:
 
 | byte 0 | byte 1 | byte 2 |
 |--------|--------|--------|
 | middle | high   | low    |
 
 That is neither little-endian (what macOS sends) nor big-endian (what the Linux
-`snd-usb-audio` quirk assumes for this card). Both of those play as noise. The layout
-was determined by ear with a byte-exact USB streamer (`tools/usbtone`), see
-[How it was found](#how-it-was-found).
+`snd-usb-audio` quirk assumes for this card), and both of those play as noise. The layout
+was determined by ear with a byte-exact USB streamer, see [How it was found](#how-it-was-found).
 
 The macOS driver cannot be told to use this layout: it rejects big-endian physical
 formats, refuses integer virtual formats and does not allow mixing to be disabled.
 
-## The solution: `ft24`
+## The solution: a Core Audio plug-in
 
-`ft24` bypasses the macOS driver and streams to the card itself:
+`driver/` builds `FastTrack24.driver`, an Audio Server plug-in that runs inside
+`coreaudiod` and drives the card directly:
 
 ```
-apps -> BlackHole 2ch -> ft24 -> USB isochronous -> Fast Track Pro outputs 1-2 and 3-4
+apps -> "Fast Track Pro 24-bit" (plug-in) -> USB isochronous -> Fast Track Pro outputs 1-2 and 3-4
 ```
 
-1. Re-selects USB configuration 2 with interface matching off, so the macOS driver
-   (`usbaudiod`) does not attach. No sudo needed.
-2. Opens output interfaces 2 and 3, selects alt 2 and sets 48 kHz on the endpoints.
-3. Reads BlackHole 2ch, converts float to 24-bit in the card's byte order and sends
-   it with isochronous writes. The endpoints are adaptive, so instead of resampling
-   `ft24` sends 47–49 samples per 1 ms USB frame to follow BlackHole's clock. Samples
-   pass through unaltered.
-4. On Ctrl-C, returns the card to configuration 1 (the normal 16-bit macOS device)
-   and restores the previous default output.
+1. When the card is plugged in, the plug-in re-selects USB configuration 2 with
+   interface matching off, so the macOS driver (`usbaudiod`) does not attach.
+2. It opens output interfaces 2 and 3, selects alt 2 and sets the endpoint sample rate.
+3. Audio from the mix is converted from float to 24-bit in the card's byte order and
+   streamed with isochronous writes. The endpoints are adaptive, so instead of
+   resampling the plug-in sends 44–45 or 47–49 samples per 1 ms USB frame to follow the
+   device clock. At full volume samples pass through unaltered.
+4. When the card is unplugged, the device disappears; when it comes back, it is
+   claimed again.
 
-Both output pairs get the same stereo signal, so the headphone jack works with the
-front-panel A/B button in either position.
+Features:
 
-### Requirements
+- 24-bit at **44.1 kHz and 48 kHz** (set in Audio MIDI Setup or by the playing app)
+- Volume and mute controls, so the keyboard volume keys work. Full volume is bit-perfect.
+- Reports its latency (about 50 ms) to Core Audio, so video stays in sync
+- Both output pairs get the same stereo signal, so the headphone jack works with the
+  front-panel A/B button in either position
+- No virtual loopback device, no background app, no microphone permission
 
-- macOS with Xcode command line tools (`xcode-select --install`)
-- [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole)
-- Microphone permission for the terminal app that runs `ft24`. Without it macOS
-  delivers silence from every input device, BlackHole included. `ft24` checks this at
-  startup and asks for it.
+Limitations:
 
-### Build and run
+- Playback only: the card's inputs and MIDI are unavailable while the plug-in owns it
+- The 88.2/96 kHz mode (alt 3) is untested and not offered
+- Audio MIDI Setup shows the stream as 32-bit float: that is the mix format Core Audio
+  hands to the plug-in; the card receives 24-bit integers
+
+## Alternative: the `ft24` command-line player
+
+`ft24/` is the first version of the same idea as a user-space program, with no
+installation. It reads from [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole)
+and streams to the card until you press Ctrl-C. It needs BlackHole installed and
+Microphone permission for the terminal app (macOS delivers silence from every input
+device without it). Don't run it while the plug-in is installed; both would claim the card.
 
 ```sh
 make -C ft24
-./ft24/ft24
+./ft24/ft24            # Ctrl-C gives the card back to macOS
+./ft24/ft24 --a-only   # outputs 1-2 only
 ```
-
-`ft24` switches the system output to BlackHole 2ch. Play audio from any app. Every
-5 s it prints a status line:
-
-```
-level 0.412  buffer  21 ms  clock   +62 ppm  underruns 0  usb errors 0
-```
-
-Press **Ctrl-C** to stop and give the card back to macOS. If `ft24` is killed without
-cleaning up, unplug and replug the card, or run:
-
-```sh
-./ft24/ft24 --release
-```
-
-Options:
-
-- `--a-only` streams only outputs 1–2 (headphone button A).
-- `--release` returns the card to macOS and exits.
-
-### Limitations
-
-- The card's inputs and MIDI are unavailable while `ft24` runs.
-- Fixed at 48 kHz. The 96 kHz mode (alt 3) is untested.
-- About 50 ms of added latency.
 
 ## How it was found
 
-The tools in `tools/` (build with `make -C tools`) drive the card directly:
+The tools in `tools/` drive the card directly:
 
 | Tool | Purpose |
 |------|---------|
 | `probe` | Lists Core Audio devices, streams and formats |
 | `desc` | Dumps the card's USB configuration descriptors |
-| `ft-config2` | `claim`: configuration 2 with the macOS driver detached. `release`: give it back |
+| `ftconfig status\|claim\|release` | Show the USB configuration, detach the macOS driver (configuration 2), or give the card back (configuration 1) |
 | `usbtone <alt> <layout> <seconds>` | Byte-exact tone on interface 2 |
 | `usbdiag.sh` | 16-bit LE/BE controls vs 24-bit LE/BE |
 | `bytediag.sh` | 8-bit tone in one byte position at a time |
@@ -107,6 +97,59 @@ Results with alt 2 at 48 kHz:
   So byte 1 is most significant, byte 0 middle, byte 2 least.
 - Full 24-bit tone as `[middle, high, low]`: clean.
 
+## Repository layout
+
+```
+driver/   Core Audio plug-in (FastTrack24.c), install/uninstall scripts, test host
+ft24/     command-line player (BlackHole 2ch -> card)
+tools/    diagnostics used to find the byte layout
+```
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Building and installing
+
+Requirements:
+
+- A Mac with macOS 12 or later (Apple silicon or Intel)
+- Xcode command line tools: `xcode-select --install`
+- An administrator password (the plug-in installs into `/Library/Audio/Plug-Ins/HAL`)
+
+Build and install:
+
+```sh
+git clone https://github.com/nclr/fasttrack-pro-24bit-macos.git
+cd fasttrack-pro-24bit-macos
+make            # builds driver/FastTrack24.driver, ft24/ft24 and tools/
+make install    # copies the plug-in and restarts Core Audio (asks for your password)
+```
+
+Then open **System Settings → Sound → Output** and select **Fast Track Pro 24-bit**.
+The regular "FastTrack Pro" entry disappears while the plug-in owns the card.
+
+The plug-in is ad-hoc signed during the build; no Apple developer account is needed.
+
+Optional checks:
+
+```sh
+make test       # loads the plug-in outside coreaudiod and streams silence (do this before `make install`)
+/usr/bin/log stream --predicate 'subsystem == "com.github.nclr.fasttrack24"'   # live plug-in log
+```
+
+## Uninstalling
+
+```sh
+make uninstall
+```
+
+This removes `/Library/Audio/Plug-Ins/HAL/FastTrack24.driver`, restarts Core Audio and
+returns the card to USB configuration 1, so it is the normal 16-bit macOS device again.
+To do the same by hand:
+
+```sh
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/FastTrack24.driver
+sudo killall coreaudiod
+make -C tools ftconfig && tools/ftconfig release   # or unplug and replug the card
+```

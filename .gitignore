@@ -1,9 +1,11 @@
 # build output
 ft24/ft24
 tools/usbtone
-tools/ft-config2
+tools/ftconfig
 tools/desc
 tools/probe
+driver/FastTrack24.driver/
+driver/testhost
 *.o
 *.dSYM/
 .DS_Store

@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
     g_remaining_ms = atoi(argv[3]) * 1000;
 
     io_service_t svc = find_interface(2);
-    if (!svc) { puts("Interface 2 not found. Run: ft-config2 claim"); return 1; }
+    if (!svc) { puts("Interface 2 not found. Run: ftconfig claim"); return 1; }
     IOCFPlugInInterface **plug; SInt32 score;
     kern_return_t kr = IOCreatePlugInInterfaceForService(svc, kIOUSBInterfaceUserClientTypeID, kIOCFPlugInInterfaceID, &plug, &score);
     IOObjectRelease(svc);
