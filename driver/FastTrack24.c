@@ -1,10 +1,13 @@
 /* FastTrack24: Core Audio server plug-in giving the M-Audio Fast Track Pro a working
  * 24-bit output on macOS.
  *
- * The card's 24-bit alt settings take 3-byte samples as [middle, high, low], which the
- * macOS USB audio driver cannot produce. This plug-in runs inside coreaudiod, detaches
- * the card from usbaudiod (USB configuration 2 with interface matching off) and streams
- * to output interfaces 2 and 3 itself:
+ * The card's 24-bit alt settings take 3-byte samples as [high, low, middle], which the
+ * macOS USB audio driver cannot produce. The card does not realign to sample boundaries,
+ * so that order only holds from a fresh start: stray bytes (a transfer that is not whole
+ * samples) shift it for good, until the card is powered up or re-enumerated again. This
+ * plug-in runs inside coreaudiod, re-enumerates the card, detaches it from usbaudiod (USB
+ * configuration 2 with interface matching off) and streams to output interfaces 2 and 3
+ * itself:
  *
  *   apps -> "Fast Track Pro 24-bit" (this plug-in) -> USB isochronous -> outputs 1-2, 3-4
  *
@@ -110,9 +113,9 @@ static inline void put24(uint8_t *p, float x) {
     int32_t s = (int32_t)lrintf(x * 8388608.0f);
     if (s > 8388607) s = 8388607;
     if (s < -8388608) s = -8388608;
-    p[0] = (uint8_t)(s >> 8);  /* middle */
-    p[1] = (uint8_t)(s >> 16); /* high */
-    p[2] = (uint8_t)s;         /* low */
+    p[0] = (uint8_t)(s >> 16); /* high */
+    p[1] = (uint8_t)s;         /* low */
+    p[2] = (uint8_t)(s >> 8);  /* middle */
 }
 
 typedef struct {
@@ -141,6 +144,8 @@ static double g_acc, g_fill_lp;
 static int64_t g_rpos;
 static unsigned g_seen_epoch;
 static int g_primed, g_inflight, g_parked, g_claim_tries;
+static int g_fresh;     /* re-enumerated since anything else could have streamed to it */
+static int g_resetting; /* our re-enumeration is under way: the detach that follows is ours */
 static unsigned g_underruns, g_usb_errors, g_retries, g_gaps;
 
 static void notify(AudioObjectID obj, AudioObjectPropertySelector sel) {
@@ -396,6 +401,21 @@ static IOUSBDeviceInterface650 **open_device_iface(void) {
     return dev;
 }
 
+/* Re-enumerate the card, which puts its sample alignment back to the power-up state.
+ * It comes back as a new device in configuration 1; on_arrive claims it again. */
+static int reset_card(void) {
+    IOUSBDeviceInterface650 **dev = open_device_iface();
+    if (!dev) return 0;
+    IOReturn r = (*dev)->USBDeviceOpenSeize(dev);
+    if (r == kIOReturnSuccess) {
+        r = (*dev)->USBDeviceReEnumerate(dev, 0);
+        if (r) (*dev)->USBDeviceClose(dev);
+    }
+    (*dev)->Release(dev);
+    if (r) LOG("re-enumerate: 0x%x", r);
+    return r == kIOReturnSuccess;
+}
+
 /* Configuration 2 with interface matching off: usbaudiod stays detached. */
 static int claim_config(void) {
     IOUSBDeviceInterface650 **dev = open_device_iface();
@@ -492,12 +512,22 @@ static void finish_stop(void) {
     close_interfaces();
     set_present(0);
     /* If the card is still attached (a transient USB error), claim it again. */
+    g_fresh = 0;
     g_claim_tries = 0;
     schedule_claim(2.0);
 }
 
 static void try_claim(void) {
     if (g_state != ST_IDLE) return;
+    if (!g_fresh) {
+        g_fresh = 1; /* reset only once: if it fails, stream anyway */
+        if (reset_card()) {
+            LOG("re-enumerating the card for a clean start");
+            g_resetting = 1;
+            schedule_claim(5.0); /* in case the card does not come back as a new device */
+            return;
+        }
+    }
     if (!claim_config()) goto retry;
     usleep(500000); /* let the configuration-2 interfaces appear */
     for (int k = 0; k < NIF; k++) {
@@ -540,6 +570,7 @@ static void on_arrive(void *refcon, io_iterator_t it) {
     }
     if (any) {
         LOG("Fast Track Pro attached");
+        g_resetting = 0;
         g_claim_tries = 0;
         schedule_claim(0.5);
     }
@@ -555,6 +586,7 @@ static void on_leave(void *refcon, io_iterator_t it) {
     }
     if (any) {
         LOG("Fast Track Pro detached");
+        if (!g_resetting) g_fresh = 0;
         begin_stop(STOP_GONE);
         if (g_state == ST_IDLE) {
             close_interfaces();

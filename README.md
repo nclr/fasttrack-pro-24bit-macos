@@ -66,15 +66,20 @@ modes live in configuration 2. When macOS drives those modes, every 24-bit forma
 plays as harsh noise.
 
 The cause is the sample byte order. On output interfaces 2 and 3, alt setting 2
-(24-bit, 44.1/48 kHz, adaptive), each 3-byte sample is laid out as:
+(24-bit, 44.1/48 kHz, adaptive), a freshly powered-up card takes each 3-byte sample as:
 
 | byte 0 | byte 1 | byte 2 |
 |--------|--------|--------|
-| middle | high   | low    |
+| high   | low    | middle |
 
 That is neither little-endian (what macOS sends) nor big-endian (what the Linux
 `snd-usb-audio` quirk assumes for this card), and both of those play as noise. The layout
 was determined by ear with a byte-exact USB streamer, see [How it was found](#how-it-was-found).
+
+The card does not realign to sample boundaries. It behaves like little-endian read from
+the wrong starting byte, and a transfer that is not a whole number of samples shifts that
+starting byte for good: the order that plays clean changes and stays changed until the
+card is powered up or re-enumerated again. A single 1-byte transfer is enough.
 
 The macOS driver cannot be told to use this layout: it rejects big-endian physical
 formats, refuses integer virtual formats and does not allow mixing to be disabled.
@@ -99,8 +104,10 @@ Ordinary apps (Music, browsers, system sounds) play on channels 1–2. A DAW can
 separate mix, such as a cue or monitor mix, to channels 3–4. The A/B button chooses which
 of the two the headphones hear.
 
-1. When the card is plugged in, the plug-in re-selects USB configuration 2 with
-   interface matching off, so the macOS driver (`usbaudiod`) does not attach.
+1. When the card is plugged in (or the plug-in starts, or streaming fails), the plug-in
+   re-enumerates it, which puts the byte alignment back to the power-up state whatever
+   was sent to the card before. It then re-selects USB configuration 2 with interface
+   matching off, so the macOS driver (`usbaudiod`) does not attach.
 2. It opens output interfaces 2 and 3, selects alt 2 and sets the endpoint sample rate.
 3. Each output stream is written into a ring indexed by sample time, so the two pairs stay
    sample-aligned. Audio is converted from float to 24-bit in the card's byte order and
@@ -138,22 +145,29 @@ both would claim the card.
 |------|---------|
 | `probe` | Lists Core Audio devices, streams and formats |
 | `desc` | Dumps the card's USB configuration descriptors |
-| `ftconfig status\|claim\|claim1\|release` | Show the USB configuration, detach the macOS driver (configuration 2, or 1 with `claim1`), or give the card back (configuration 1) |
-| `usbtone <alt> <layout> <seconds> [interface] [Hz]` | Byte-exact tone on interface 2 (outputs 1–2) or 3 (outputs 3–4) |
+| `ftconfig status\|claim\|claim1\|release\|reset` | Show the USB configuration, detach the macOS driver (configuration 2, or 1 with `claim1`), give the card back (configuration 1), or re-enumerate it (`reset`: back to the power-up byte alignment) |
+| `usbtone <alt> <layout> <seconds> [interface] [Hz] [pad]` | Byte-exact tone on interface 2 (outputs 1–2) or 3 (outputs 3–4). `pad` sends that many bytes as a packet of their own first; `FT_WAV=file.wav` plays a mono 16-bit 48 kHz recording (for example from `say -o f.wav --data-format=LEI16@48000`) instead of the tone |
 | `usbrec <interface> <seconds> [file] [alt]` | Raw capture from input interface 4 or 5, with a byte-layout smoothness check |
 | `carec <seconds>` | Records the inputs through the macOS driver and reports level and repeated-byte samples |
 | `session.sh` | A/B button test (440 Hz on outputs 1–2, 660 Hz on 3–4), then a `carec` recording |
 | `usbdiag.sh` | 16-bit LE/BE controls vs 24-bit LE/BE |
 | `bytediag.sh` | 8-bit tone in one byte position at a time |
-| `permdiag.sh` | Full 24-bit tone in `MHL` vs `HML` layout |
+| `permdiag.sh` | Resets the card, then plays a full 24-bit tone in each byte rotation (`HLM`, `MHL`, `LMH`) |
 
-Results with alt 2 at 48 kHz:
+Results with alt 2 at 48 kHz (the first ones on a card in an unknown state, see below):
 
 - 16-bit little-endian: clean tone; 16-bit big-endian: noise. The streamer is correct.
 - 24-bit little-endian and big-endian: both noise.
 - Tone in byte 0 only: audible. Byte 1 only: louder. Byte 2 only: silence.
   So byte 1 is most significant, byte 0 middle, byte 2 least.
 - Full 24-bit tone as `[middle, high, low]`: clean.
+- After the card was unplugged and plugged in again, `[middle, high, low]` played as noise
+  and `[high, low, middle]` was clean, the same order read one byte later. That stayed
+  the same across configuration switches and stream restarts, and after every power-up
+  or re-enumeration (`ftconfig reset`). One 1-byte packet (`usbtone 2 HLM 4 2 440 1`)
+  turned it into noise for that and later streams until the next re-enumeration. So the
+  earlier sessions ran on a card that stray bytes had already shifted, probably from the
+  macOS 16-bit driver, whose 44.1 kHz packets (176 bytes) are not a multiple of 3.
 - 440 Hz on outputs 1–2 and 660 Hz on outputs 3–4 at the same time: the low tone with the
   A/B button out, the high tone with it in.
 

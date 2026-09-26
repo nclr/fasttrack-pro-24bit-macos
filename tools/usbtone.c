@@ -7,7 +7,9 @@
  *     HML/MHL/...: byte 0,1,2 carry the High/Mid/Low byte of each sample
  *     b0..b2: 8-bit tone in that byte of each 24-bit sample, other bytes zero
  *     alt 1 = 16-bit, alt 2 = 24-bit (adaptive), both 48 kHz
- *   optional: interface (2 = outputs 1-2, 3 = outputs 3-4) and tone frequency in Hz
+ *   optional: interface (2 = outputs 1-2, 3 = outputs 3-4), tone frequency in Hz, and a
+ *   number of bytes to send first as a packet of their own (byte-alignment test)
+ *   FT_WAV=file.wav plays that recording (mono 16-bit 48 kHz) instead of the tone
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -33,6 +35,9 @@ static UInt64 g_next_frame;
 static int g_remaining_ms;
 static int g_inflight;
 static int g_errors;
+static int16_t *g_wav;    /* FT_WAV: mono 16-bit PCM played instead of the tone */
+static size_t g_wav_len, g_wav_pos;
+static int g_pad;         /* bytes in a leading packet with no whole samples (alignment test) */
 
 typedef struct {
     uint8_t buf[FRAMES_PER_XFER * 49 * 2 * 3];
@@ -60,11 +65,21 @@ static void put(uint8_t *p, int32_t s) {
 static void fill(Xfer *x) {
     uint8_t *p = x->buf;
     for (int f = 0; f < FRAMES_PER_XFER; f++) {
+        if (g_pad) {
+            memset(p, 0, (size_t)g_pad);
+            p += g_pad;
+            x->fl[f].frReqCount = (UInt16)g_pad;
+            x->fl[f].frActCount = 0;
+            x->fl[f].frStatus = 0;
+            g_pad = 0;
+            continue;
+        }
         g_acc += RATE / 1000.0;
         int n = (int)g_acc;
         g_acc -= n;
         for (int i = 0; i < n; i++) {
-            int32_t s = (int32_t)lrint(0.1 * sin(g_phase) * 8388607.0);
+            int32_t s = g_wav ? (g_wav_pos < g_wav_len ? g_wav[g_wav_pos++] * 256 : 0)
+                              : (int32_t)lrint(0.1 * sin(g_phase) * 8388607.0);
             g_phase += 2 * M_PI * g_freq / RATE;
             if (g_phase > 2 * M_PI) g_phase -= 2 * M_PI;
             put(p, s); p += g_bytes;
@@ -134,16 +149,38 @@ static io_service_t find_interface(int num) {
     return found;
 }
 
+/* WAV with a mono 16-bit little-endian data chunk at 48 kHz, e.g. from
+ * say -o f.wav --data-format=LEI16@48000 */
+static int load_wav(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return 0; }
+    uint8_t h[12], c[8];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) { fclose(f); puts("not a WAV"); return 0; }
+    while (fread(c, 1, 8, f) == 8) {
+        uint32_t n = c[4] | c[5] << 8 | c[6] << 16 | (uint32_t)c[7] << 24;
+        if (memcmp(c, "data", 4)) { fseek(f, (n + 1) & ~1u, SEEK_CUR); continue; }
+        g_wav = malloc(n);
+        g_wav_len = fread(g_wav, 1, n, f) / 2;
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+    puts("WAV has no data chunk");
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 4) { puts("usage: usbtone <alt 1|2> <layout> <seconds> [interface 2|3] [Hz]"); return 2; }
+    if (argc < 4) { puts("usage: usbtone <alt 1|2> <layout> <seconds> [interface 2|3] [Hz] [pad bytes]"); return 2; }
     int ifnum = argc > 4 ? atoi(argv[4]) : 2;
     if (argc > 5) g_freq = atof(argv[5]);
+    if (argc > 6) g_pad = atoi(argv[6]);
     int alt = atoi(argv[1]);
     g_be = !strcmp(argv[2], "be");
     if (strlen(argv[2]) == 3 && strspn(argv[2], "HML") == 3) g_perm = argv[2];
     if (argv[2][0] == 'b' && argv[2][1] >= '0' && argv[2][1] <= '2') g_bytepos = argv[2][1] - '0';
     g_bytes = alt == 1 ? 2 : 3;
     g_remaining_ms = atoi(argv[3]) * 1000;
+    if (getenv("FT_WAV") && !load_wav(getenv("FT_WAV"))) return 1;
 
     io_service_t svc = find_interface(ifnum);
     if (!svc) { printf("Interface %d not found. Run: ftconfig claim\n", ifnum); return 1; }

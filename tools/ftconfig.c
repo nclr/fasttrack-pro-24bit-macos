@@ -5,6 +5,7 @@
  *                      so the macOS driver stays detached and tools can drive the card
  *   ftconfig release   configuration 1 with matching on: the normal 16-bit macOS device
  *   ftconfig claim1    configuration 1 with matching off (16-bit class-compliant mode, for tests)
+ *   ftconfig reset     re-enumerate the card (USB reset without unplugging); it comes back in configuration 1
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -16,8 +17,9 @@
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : "";
     int claim = !strcmp(cmd, "claim"), claim1 = !strcmp(cmd, "claim1"), release = !strcmp(cmd, "release"), status = !strcmp(cmd, "status");
-    if (!claim && !claim1 && !release && !status) {
-        fprintf(stderr, "usage: ftconfig status|claim|claim1|release\n");
+    int reset = !strcmp(cmd, "reset");
+    if (!claim && !claim1 && !release && !status && !reset) {
+        fprintf(stderr, "usage: ftconfig status|claim|claim1|release|reset\n");
         return 2;
     }
 
@@ -59,6 +61,16 @@ int main(int argc, char **argv) {
     }
 
     IOReturn r = (*dev)->USBDeviceOpenSeize(dev);
+    if (r == kIOReturnSuccess && reset) {
+        r = (*dev)->USBDeviceReEnumerate(dev, 0);
+        (*dev)->Release(dev);
+        if (r) {
+            fprintf(stderr, "re-enumerate failed: 0x%x\n", r);
+            return 1;
+        }
+        puts("re-enumerating");
+        return 0;
+    }
     if (r == kIOReturnSuccess) {
         if (claim) {
             (*dev)->SetConfigurationV2(dev, 1, false, false);
