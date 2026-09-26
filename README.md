@@ -6,6 +6,39 @@ the built-in USB audio driver only produces loud static in 24-bit mode.
 It installs a Core Audio plug-in that adds a **"Fast Track Pro 24-bit"** output device.
 Select it in System Settings like any other sound output.
 
+## Building and installing
+
+Requirements:
+
+- A Mac with macOS 12 or later (Apple silicon or Intel)
+- Xcode command line tools: `xcode-select --install`
+- An administrator password (the plug-in installs into `/Library/Audio/Plug-Ins/HAL`)
+
+Build and install:
+
+```sh
+git clone https://github.com/nclr/fasttrack-pro-24bit-macos.git
+cd fasttrack-pro-24bit-macos
+make            # builds driver/FastTrack24.driver and tools/
+make install    # copies the plug-in and restarts Core Audio (asks for your password)
+```
+
+Then open **System Settings → Sound → Output** and select **Fast Track Pro 24-bit**.
+The regular "FastTrack Pro" entry disappears while the plug-in owns the card.
+
+The plug-in is ad-hoc signed during the build; no Apple developer account is needed.
+
+Optional checks:
+
+```sh
+make test       # loads the plug-in outside coreaudiod and streams silence (do this before `make install`)
+/usr/bin/log stream --predicate 'subsystem == "com.github.nclr.fasttrack24"'   # live plug-in log
+```
+
+The plug-in logs a health line 30 s after it starts streaming and afterwards only when
+something goes wrong. Healthy playback looks like
+`last 30 s: 0 retries, 0 gaps, 0 underruns, 0 errors`.
+
 ## The problem
 
 The Fast Track Pro boots in USB configuration 1 (16-bit, class compliant). Its 24-bit
@@ -91,43 +124,6 @@ driver/   Core Audio plug-in (FastTrack24.c), install/uninstall scripts, test ho
 tools/    diagnostics used to find the byte layout
 ```
 
-## License
-
-MIT, see [LICENSE](LICENSE).
-
-## Building and installing
-
-Requirements:
-
-- A Mac with macOS 12 or later (Apple silicon or Intel)
-- Xcode command line tools: `xcode-select --install`
-- An administrator password (the plug-in installs into `/Library/Audio/Plug-Ins/HAL`)
-
-Build and install:
-
-```sh
-git clone https://github.com/nclr/fasttrack-pro-24bit-macos.git
-cd fasttrack-pro-24bit-macos
-make            # builds driver/FastTrack24.driver and tools/
-make install    # copies the plug-in and restarts Core Audio (asks for your password)
-```
-
-Then open **System Settings → Sound → Output** and select **Fast Track Pro 24-bit**.
-The regular "FastTrack Pro" entry disappears while the plug-in owns the card.
-
-The plug-in is ad-hoc signed during the build; no Apple developer account is needed.
-
-Optional checks:
-
-```sh
-make test       # loads the plug-in outside coreaudiod and streams silence (do this before `make install`)
-/usr/bin/log stream --predicate 'subsystem == "com.github.nclr.fasttrack24"'   # live plug-in log
-```
-
-The plug-in logs a health line 30 s after it starts streaming and afterwards only when
-something goes wrong. Healthy playback looks like
-`last 30 s: 0 retries, 0 gaps, 0 underruns, 0 errors`.
-
 ## Uninstalling
 
 ```sh
@@ -144,3 +140,7 @@ sudo pkill -9 -f "Core Audio Driver \(FastTrack24.driver\)"   # the plug-in's he
 sudo killall coreaudiod
 make -C tools ftconfig && tools/ftconfig release   # or unplug and replug the card
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
