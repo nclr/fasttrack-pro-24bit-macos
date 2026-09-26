@@ -11,4 +11,9 @@ echo "Restarting Core Audio (sound drops for a few seconds)..."
 sudo sh -c 'pkill -9 -f "Core Audio Driver \\(FastTrack24.driver\\)"; killall coreaudiod'
 sleep 2
 "$D/../tools/ftconfig" release
+# Installed by the .pkg installer, if that was used
+sudo rm -rf "/Applications/Utilities/Uninstall Fast Track Pro 24-bit.app"
+for id in com.github.nclr.fasttrack24 com.github.nclr.fasttrack24.uninstaller; do
+  sudo pkgutil --forget "$id" >/dev/null 2>&1 || true
+done
 echo "Done. The Fast Track Pro is back as the normal 16-bit macOS device."
