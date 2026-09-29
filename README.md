@@ -106,7 +106,7 @@ separate mix, such as a cue or monitor mix, to channels 3–4. The A/B button ch
 of the two the headphones hear.
 
 1. When the card is plugged in (or the plug-in starts, or streaming fails), the plug-in
-   re-enumerates it, which puts the byte alignment back to the power-up state whatever
+   re-enumerates it, which normally puts the byte alignment back to the power-up state whatever
    was sent to the card before. It then re-selects USB configuration 2 with interface
    matching off, so the macOS driver (`usbaudiod`) does not attach.
 2. It opens output interfaces 2 and 3, selects alt 2 and sets the endpoint sample rate.
@@ -136,6 +136,16 @@ Limitations:
 - The 88.2/96 kHz mode (alt 3) is untested and not offered
 - Audio MIDI Setup shows the stream as 32-bit float: that is the mix format Core Audio
   hands to the plug-in; the card receives 24-bit integers
+
+### If it plays noise or nothing
+
+The card has no way to report how it splits the byte stream into samples, and a wrong
+split plays as loud noise or as silence. The plug-in resets the card before every stream,
+which has always fixed it so far. If it does happen:
+
+- unplug the card and plug it in again (the plug-in resets it before streaming), or
+- with the source tree, run `tools/ftconfig reset` while the plug-in is installed: the
+  plug-in claims the card again after the reset. Sound stops for about three seconds.
 
 ## How it was found
 
@@ -177,6 +187,14 @@ Results with alt 2 at 48 kHz (the first ones on a card in an unknown state, see 
   hissed, big-endian was clean. So the card is big-endian from power-up, and every by-ear
   test above mixed up the middle and low bytes, which differ by only 48 dB and are easy
   to confuse with a tone or at normal volume. The early big-endian test ran on a shifted card.
+- Plug-in 1.4 skipped the reset when the card was plugged in after it had been unplugged
+  once, and the card played silence. The card then played noise once straight after a
+  reset (`ftconfig reset`), and was clean after the next ones. So a reset is the fix, but
+  not guaranteed on the first try.
+- A packet with only stray bytes (1 byte, then 5 more) sent by the plug-in while music
+  played silenced the card instead of shifting it, and the 5 bytes did not bring it back;
+  a reset did. One stray byte in front of 48 whole samples in the same packet changed
+  nothing. Stray bytes can't be used to realign the card.
 - 440 Hz on outputs 1–2 and 660 Hz on outputs 3–4 at the same time: the low tone with the
   A/B button out, the high tone with it in.
 

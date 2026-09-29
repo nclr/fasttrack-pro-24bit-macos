@@ -147,6 +147,7 @@ static int g_primed, g_inflight, g_parked, g_claim_tries;
 static int g_fresh;     /* re-enumerated since anything else could have streamed to it */
 static int g_resetting; /* our re-enumeration is under way: the detach that follows is ours */
 static unsigned g_underruns, g_usb_errors, g_retries, g_gaps;
+static unsigned g_logged; /* USB errors logged in this stream */
 
 static void notify(AudioObjectID obj, AudioObjectPropertySelector sel) {
     AudioObjectPropertyAddress a = {sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -170,8 +171,11 @@ static void fill_slot(Slot *s) {
     if (epoch != g_seen_epoch) { /* IO restarted: sample time starts over */
         g_seen_epoch = epoch;
         g_primed = 0;
+        g_rpos = 0;
     }
-    if (!g_primed && head >= TARGET) {
+    /* Prime once TARGET new samples are buffered. After running dry, g_rpos == head, so
+     * this waits for fresh audio instead of replaying the cleared ring. */
+    if (!g_primed && head - g_rpos >= TARGET) {
         g_rpos = head - TARGET;
         g_primed = 1;
     }
@@ -297,7 +301,8 @@ static void issue(Slot *s) {
         } else {
             s->todo[k] = 0; /* too late or failed: this transfer is lost */
             g_gaps++;
-            if (g_usb_errors++ < 10) LOG("WriteIsochPipeAsync: 0x%x (frame %llu, bus %llu)", r, s->frame, bus_frame());
+            g_usb_errors++;
+            if (g_logged++ < 10) LOG("WriteIsochPipeAsync: 0x%x (frame %llu, bus %llu)", r, s->frame, bus_frame());
             if (r == kIOReturnNoDevice || r == kIOReturnNotOpen || r == kIOReturnNotResponding) gone = 1;
         }
     }
@@ -316,7 +321,8 @@ static void on_done(void *refcon, IOReturn result, void *arg0) {
     g_inflight--;
     s->pending--;
     if (result != kIOReturnSuccess && result != kIOReturnUnderrun && result != kIOReturnAborted) {
-        if (g_usb_errors++ < 10) LOG("iso write completed with 0x%x", result);
+        g_usb_errors++;
+        if (g_logged++ < 10) LOG("iso write completed with 0x%x", result);
         if (result == kIOReturnNoDevice || result == kIOReturnNotResponding || result == kIOReturnNotOpen) begin_stop(STOP_GONE);
     }
     if (s->pending == 0 && !s->parked) slot_done(s);
@@ -370,6 +376,7 @@ static void start_stream(void) {
     g_acc = 0;
     g_fill_lp = TARGET;
     g_primed = 0;
+    g_logged = 0;
     g_next_frame = bus_frame() + 16; /* first submissions can be slow: leave headroom */
     g_state = ST_STREAMING;
     for (int i = 0; i < NSLOT && g_state == ST_STREAMING; i++) submit(&g_slot[i]);
@@ -570,6 +577,9 @@ static void on_arrive(void *refcon, io_iterator_t it) {
     }
     if (any) {
         LOG("Fast Track Pro attached");
+        /* Plugged in, not our own re-enumeration: macOS's driver may have streamed to it
+         * already, so reset it before streaming. */
+        if (!g_resetting) g_fresh = 0;
         g_resetting = 0;
         g_claim_tries = 0;
         schedule_claim(0.5);
