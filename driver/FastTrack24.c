@@ -20,12 +20,17 @@
  * frame to follow a FIFO fill target instead of resampling. Samples pass through
  * unaltered at full volume.
  *
- * The device is published only while the card is attached and claimed.
+ * The device is published only while the card is attached and claimed. The USB stream
+ * runs only while Core Audio does IO (and for QUIET_MS after). Anything that goes wrong on
+ * the bus may leave the card shifted, and the card cannot tell, so the plug-in then
+ * re-enumerates it at the next quiet moment, keeping the device published.
  */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <IOKit/usb/IOUSBLib.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -64,11 +69,13 @@ enum {
     MAX_PER_MS = 49,
     NIF = 2,
     NOUT = 4,              /* output channels: 1-2 on interface 2, 3-4 on interface 3 */
+    QUIET_MS = 5000,       /* silence before the stream stops (no IO) or the card is reset */
 };
 static const int OUT_IFACES[NIF] = {2, 3};
 static const Float64 RATES[] = {44100.0, 48000.0};
 enum { NRATES = 2 };
 static const Float32 MIN_DB = -64.0f;
+static const float SILENCE = 1.0f / 65536; /* quieter than this (-96 dBFS) counts as silence */
 
 static os_log_t g_log;
 #define LOG(...) os_log(g_log, __VA_ARGS__)
@@ -128,14 +135,17 @@ typedef struct {
     int refill;     /* retry timer should refill instead of re-issuing */
 } Slot;
 
-typedef enum { ST_IDLE, ST_STREAMING, ST_STOPPING } StreamState;
-typedef enum { STOP_RATE, STOP_GONE } StopReason;
+/* ST_IDLE: card not claimed. ST_READY: claimed (interfaces open at alt 2), not streaming. */
+typedef enum { ST_IDLE, ST_READY, ST_STREAMING, ST_STOPPING } StreamState;
+/* In order of precedence: a stop already under way takes on a later reason. */
+typedef enum { STOP_RATE, STOP_IDLE, STOP_RESET, STOP_GONE } StopReason;
 
 static Slot g_slot[NSLOT];
 static IOUSBInterfaceInterface650 **g_if[NIF];
 static CFRunLoopSourceRef g_src[NIF];
 static UInt8 g_pipe[NIF];
 static CFRunLoopRef g_usb_rl;
+static CFRunLoopSourceRef g_poke; /* signalled to run service() on the USB thread */
 static StreamState g_state = ST_IDLE;
 static StopReason g_stop_reason;
 static Float64 g_stream_rate;
@@ -144,9 +154,12 @@ static double g_acc, g_fill_lp;
 static int64_t g_rpos;
 static unsigned g_seen_epoch;
 static int g_primed, g_inflight, g_parked, g_claim_tries;
-static int g_fresh;     /* re-enumerated since anything else could have streamed to it */
-static int g_resetting; /* our re-enumeration is under way: the detach that follows is ours */
+static int g_quiet_ms;  /* the stream has carried only silence for this long */
+static int g_fresh;     /* re-enumerated, and nothing since could have shifted the card */
+static int g_resetting; /* our re-enumeration: 1 = requested, 2 = the card has left */
+static int g_sleeping;  /* the system is going to sleep or asleep */
 static unsigned g_underruns, g_usb_errors, g_retries, g_gaps;
+static IOReturn g_last_error;
 static unsigned g_logged; /* USB errors logged in this stream */
 
 static void notify(AudioObjectID obj, AudioObjectPropertySelector sel) {
@@ -186,6 +199,7 @@ static void fill_slot(Slot *s) {
     if (corr < -0.001) corr = -0.001;
 
     UInt8 *dst[NIF];
+    int loud = 0;
     for (int k = 0; k < NIF; k++) dst[k] = s->buf[k];
     for (int f = 0; f < FRAMES_PER_SLOT; f++) {
         g_acc += g_stream_rate / 1000.0 * (1.0 + corr);
@@ -199,6 +213,7 @@ static void fill_slot(Slot *s) {
                 memcpy(frame, src, sizeof frame);
                 memset(src, 0, sizeof frame);
                 g_rpos++;
+                for (int c = 0; c < NOUT; c++) loud |= fabsf(frame[c]) >= SILENCE;
             } else if (g_primed) {
                 g_primed = 0; /* ran dry: output silence until TARGET is buffered again */
                 g_underruns++;
@@ -216,12 +231,29 @@ static void fill_slot(Slot *s) {
             s->fl[k][f].frStatus = 0;
         }
     }
+    if (loud) g_quiet_ms = 0;
+    else if (g_quiet_ms < QUIET_MS) g_quiet_ms += FRAMES_PER_SLOT;
 }
 
 static void submit(Slot *s);
 static void on_done(void *refcon, IOReturn result, void *arg0);
 static void finish_stop(void);
-static void schedule_claim(double delay);
+static void after(double delay, void (*fn)(void));
+static void try_claim(void);
+
+/* Something went wrong on the bus while streaming (r = 0: a gap). The card may have taken
+ * part of a sample and shifted its byte alignment for good, and it has no way to tell:
+ * reset it at the next quiet moment. */
+static void suspect(IOReturn r) {
+    if (g_fresh) LOG("USB %{public}s 0x%x: the card will be reset when it is quiet", r ? "error" : "gap", r);
+    g_fresh = 0;
+}
+
+static void usb_error(IOReturn r) {
+    g_usb_errors++;
+    g_last_error = r;
+    suspect(r);
+}
 
 static UInt64 bus_frame(void) {
     AbsoluteTime at;
@@ -236,7 +268,7 @@ static void maybe_finish(void) {
 
 static void begin_stop(StopReason why) {
     if (g_state != ST_STREAMING) {
-        if (why == STOP_GONE) g_stop_reason = STOP_GONE; /* upgrade a pending rate change */
+        if (g_state == ST_STOPPING && why > g_stop_reason) g_stop_reason = why;
         return;
     }
     g_state = ST_STOPPING;
@@ -301,7 +333,7 @@ static void issue(Slot *s) {
         } else {
             s->todo[k] = 0; /* too late or failed: this transfer is lost */
             g_gaps++;
-            g_usb_errors++;
+            usb_error(r);
             if (g_logged++ < 10) LOG("WriteIsochPipeAsync: 0x%x (frame %llu, bus %llu)", r, s->frame, bus_frame());
             if (r == kIOReturnNoDevice || r == kIOReturnNotOpen || r == kIOReturnNotResponding) gone = 1;
         }
@@ -315,14 +347,31 @@ static void issue(Slot *s) {
     if (gone) begin_stop(STOP_GONE);
 }
 
+/* Every frame should have gone out whole. One that did not may have delivered part of a
+ * sample. arg0 is the transfer's frame list. A frame count left at 0 is not taken as short,
+ * in case the controller does not report counts for writes. */
 static void on_done(void *refcon, IOReturn result, void *arg0) {
-    (void)arg0;
     Slot *s = refcon;
     g_inflight--;
     s->pending--;
-    if (result != kIOReturnSuccess && result != kIOReturnUnderrun && result != kIOReturnAborted) {
-        g_usb_errors++;
-        if (g_logged++ < 10) LOG("iso write completed with 0x%x", result);
+    if (result != kIOReturnAborted) {
+        int bad = 0;
+        for (int k = 0; k < NIF; k++) {
+            if (arg0 != s->fl[k]) continue;
+            for (int f = 0; f < FRAMES_PER_SLOT; f++) {
+                IOUSBIsocFrame *fr = &s->fl[k][f];
+                if (fr->frStatus == kIOReturnSuccess && (fr->frActCount == 0 || fr->frActCount == fr->frReqCount)) continue;
+                bad = 1;
+                usb_error(fr->frStatus ? fr->frStatus : kIOReturnUnderrun);
+                if (g_logged++ < 10)
+                    LOG("interface %d frame %llu: 0x%x, %u of %u bytes", OUT_IFACES[k], s->frame + (UInt64)f, fr->frStatus,
+                        fr->frActCount, fr->frReqCount);
+            }
+        }
+        if (result != kIOReturnSuccess && !bad) {
+            usb_error(result);
+            if (g_logged++ < 10) LOG("iso write completed with 0x%x", result);
+        }
         if (result == kIOReturnNoDevice || result == kIOReturnNotResponding || result == kIOReturnNotOpen) begin_stop(STOP_GONE);
     }
     if (s->pending == 0 && !s->parked) slot_done(s);
@@ -332,6 +381,7 @@ static void submit(Slot *s) {
     UInt64 bus = bus_frame();
     if (g_next_frame < bus + 4) { /* fell behind the bus: skip ahead, leaving a gap */
         g_gaps++;
+        suspect(0);
         g_next_frame = bus + 8;
     }
     fill_slot(s);
@@ -347,10 +397,13 @@ static void stats_timer(CFRunLoopTimerRef t, void *info) {
     static unsigned last[4];
     static int reported;
     unsigned now[4] = {g_retries, g_gaps, g_underruns, g_usb_errors};
-    if (reported && memcmp(now, last, sizeof now) == 0) return; /* quiet while healthy */
+    if (reported && memcmp(now, last, sizeof now) == 0) return; /* quiet while healthy or stopped */
     reported = 1;
-    LOG("last 30 s: %u retries, %u gaps, %u underruns, %u errors", now[0] - last[0], now[1] - last[1], now[2] - last[2],
-        now[3] - last[3]);
+    if (now[3] != last[3])
+        LOG("last 30 s: %u retries, %u gaps, %u underruns, %u errors (last 0x%x)", now[0] - last[0], now[1] - last[1],
+            now[2] - last[2], now[3] - last[3], g_last_error);
+    else
+        LOG("last 30 s: %u retries, %u gaps, %u underruns, 0 errors", now[0] - last[0], now[1] - last[1], now[2] - last[2]);
     memcpy(last, now, sizeof now);
 }
 
@@ -376,6 +429,7 @@ static void start_stream(void) {
     g_acc = 0;
     g_fill_lp = TARGET;
     g_primed = 0;
+    g_quiet_ms = 0;
     g_logged = 0;
     g_next_frame = bus_frame() + 16; /* first submissions can be slow: leave headroom */
     g_state = ST_STREAMING;
@@ -509,11 +563,34 @@ static void close_interfaces(void) {
     }
 }
 
+/* Run service() on the USB thread soon. Safe from any thread. */
+static void poke(void) {
+    if (!g_poke) return;
+    CFRunLoopSourceSignal(g_poke);
+    CFRunLoopWakeUp(g_usb_rl);
+}
+
+static int io_running(void) {
+    pthread_mutex_lock(&g_mutex);
+    int running = g_io_clients > 0;
+    pthread_mutex_unlock(&g_mutex);
+    return running;
+}
+
 static void finish_stop(void) {
-    if (g_stop_reason == STOP_RATE) {
+    switch (g_stop_reason) {
+    case STOP_RATE:
         LOG("restarting stream for the new sample rate");
         start_stream();
         return;
+    case STOP_IDLE:
+    case STOP_RESET:
+        LOG("stream stopped (%{public}s)", g_stop_reason == STOP_IDLE ? "nothing playing" : "to reset the card");
+        g_state = ST_READY;
+        poke(); /* service() resets the card if needed, outside this completion */
+        return;
+    case STOP_GONE:
+        break;
     }
     g_state = ST_IDLE;
     close_interfaces();
@@ -521,7 +598,21 @@ static void finish_stop(void) {
     /* If the card is still attached (a transient USB error), claim it again. */
     g_fresh = 0;
     g_claim_tries = 0;
-    schedule_claim(2.0);
+    after(2.0, try_claim);
+}
+
+/* Re-enumerate the card while nothing is playing. The device stays published, so Core
+ * Audio keeps it selected; audio sent in the few seconds until the card is back is lost. */
+static void reset_quietly(void) {
+    close_interfaces();
+    g_state = ST_IDLE;
+    g_claim_tries = 0;
+    try_claim();
+}
+
+static void reset_timeout(void) {
+    if (g_resetting == 1) g_resetting = 0; /* the card never left: it was not re-enumerated */
+    try_claim();
 }
 
 static void try_claim(void) {
@@ -531,7 +622,7 @@ static void try_claim(void) {
         if (reset_card()) {
             LOG("re-enumerating the card for a clean start");
             g_resetting = 1;
-            schedule_claim(5.0); /* in case the card does not come back as a new device */
+            after(5.0, reset_timeout); /* in case the card does not come back as a new device */
             return;
         }
     }
@@ -547,22 +638,27 @@ static void try_claim(void) {
         CFRunLoopAddSource(g_usb_rl, g_src[k], kCFRunLoopDefaultMode);
     }
     g_claim_tries = 0;
-    start_stream();
+    g_state = ST_READY;
     set_present(1);
+    if (io_running()) start_stream();
     return;
 retry:
-    if (++g_claim_tries < 6) schedule_claim(1.0);
-    else LOG("giving up on the Fast Track Pro until it is plugged in again");
+    if (++g_claim_tries < 6) {
+        after(1.0, try_claim);
+    } else {
+        LOG("giving up on the Fast Track Pro until it is plugged in again");
+        set_present(0);
+    }
 }
 
-static void claim_timer(CFRunLoopTimerRef t, void *info) {
+static void timer_fired(CFRunLoopTimerRef t, void *info) {
     (void)t;
-    (void)info;
-    try_claim();
+    ((void (*)(void))info)();
 }
 
-static void schedule_claim(double delay) {
-    CFRunLoopTimerRef t = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + delay, 0, 0, 0, claim_timer, NULL);
+static void after(double delay, void (*fn)(void)) {
+    CFRunLoopTimerContext ctx = {0, (void *)fn, NULL, NULL, NULL};
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + delay, 0, 0, 0, timer_fired, &ctx);
     CFRunLoopAddTimer(g_usb_rl, t, kCFRunLoopDefaultMode);
     CFRelease(t);
 }
@@ -582,7 +678,7 @@ static void on_arrive(void *refcon, io_iterator_t it) {
         if (!g_resetting) g_fresh = 0;
         g_resetting = 0;
         g_claim_tries = 0;
-        schedule_claim(0.5);
+        after(0.5, try_claim);
     }
 }
 
@@ -596,12 +692,66 @@ static void on_leave(void *refcon, io_iterator_t it) {
     }
     if (any) {
         LOG("Fast Track Pro detached");
-        if (!g_resetting) g_fresh = 0;
+        if (g_resetting) g_resetting = 2; /* ours: it comes back as a new device */
+        else g_fresh = 0;
         begin_stop(STOP_GONE);
-        if (g_state == ST_IDLE) {
+        if (g_state == ST_IDLE || g_state == ST_READY) {
             close_interfaces();
-            set_present(0);
+            g_state = ST_IDLE;
+            if (!g_resetting) set_present(0);
         }
+    }
+}
+
+/* Keeps the stream in line with Core Audio's IO and resets a suspect card while it is
+ * quiet. Runs every second, when IO starts, after a stream stops and after waking. */
+static void service(void) {
+    if (g_sleeping) return;
+    int running = io_running();
+    if (g_state == ST_READY) {
+        if (!g_fresh) reset_quietly(); /* before the next stream, not during it */
+        else if (running) start_stream();
+    } else if (g_state == ST_STREAMING && g_quiet_ms >= QUIET_MS && (!g_fresh || !running)) {
+        begin_stop(g_fresh ? STOP_IDLE : STOP_RESET);
+    }
+}
+
+static void poke_perform(void *info) {
+    (void)info;
+    service();
+}
+
+static void tick(CFRunLoopTimerRef t, void *info) {
+    (void)t;
+    (void)info;
+    service();
+}
+
+/* Stop streaming before the system sleeps. If the stream was still running then, transfers
+ * cut off by the bus suspending could have shifted the card: reset it after waking. */
+static io_connect_t g_pm_root;
+
+static void on_power(void *refcon, io_service_t svc, uint32_t msg, void *arg) {
+    (void)refcon;
+    (void)svc;
+    switch (msg) {
+    case kIOMessageCanSystemSleep:
+        IOAllowPowerChange(g_pm_root, (intptr_t)arg);
+        break;
+    case kIOMessageSystemWillSleep:
+        g_sleeping = 1;
+        if (g_state == ST_STREAMING || g_state == ST_STOPPING) {
+            LOG("system going to sleep: stopping the stream, the card will be reset after waking");
+            g_fresh = 0;
+            begin_stop(STOP_IDLE);
+        }
+        IOAllowPowerChange(g_pm_root, (intptr_t)arg);
+        break;
+    case kIOMessageSystemWillNotSleep:
+    case kIOMessageSystemHasPoweredOn:
+        g_sleeping = 0;
+        service();
+        break;
     }
 }
 
@@ -641,6 +791,14 @@ static void *usb_thread(void *arg) {
     pthread_setname_np("FastTrack24 USB");
     make_realtime();
     g_usb_rl = CFRunLoopGetCurrent();
+    CFRunLoopSourceContext pc = {.perform = poke_perform};
+    g_poke = CFRunLoopSourceCreate(NULL, 0, &pc);
+    CFRunLoopAddSource(g_usb_rl, g_poke, kCFRunLoopDefaultMode);
+    IONotificationPortRef pm_port = NULL;
+    io_object_t pm_notifier = 0;
+    g_pm_root = IORegisterForSystemPower(NULL, &pm_port, on_power, &pm_notifier);
+    if (g_pm_root) CFRunLoopAddSource(g_usb_rl, IONotificationPortGetRunLoopSource(pm_port), kCFRunLoopDefaultMode);
+    else LOG("no sleep notifications: after waking, the card is reset only if USB errors show");
     IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
     CFRunLoopAddSource(g_usb_rl, IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
     io_iterator_t add_it = 0, rm_it = 0;
@@ -650,6 +808,8 @@ static void *usb_thread(void *arg) {
     on_arrive(NULL, add_it);
     CFRunLoopTimerRef stats = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 30, 30, 0, 0, stats_timer, NULL);
     CFRunLoopAddTimer(g_usb_rl, stats, kCFRunLoopDefaultMode);
+    CFRunLoopTimerRef ticker = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1, 1, 0, 0, tick, NULL);
+    CFRunLoopAddTimer(g_usb_rl, ticker, kCFRunLoopDefaultMode);
     CFRunLoopRun();
     return NULL;
 }
@@ -1084,7 +1244,8 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
     (void)d; (void)client;
     if (dev != kObjDevice) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&g_mutex);
-    if (g_io_clients++ == 0) {
+    int first = g_io_clients++ == 0;
+    if (first) {
         g_anchor = mach_absolute_time();
         g_ts_count = 0;
         memset(g_ring, 0, sizeof g_ring);
@@ -1092,6 +1253,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
         atomic_fetch_add(&g_epoch, 1);
     }
     pthread_mutex_unlock(&g_mutex);
+    if (first) poke(); /* start the USB stream now rather than on the next tick */
     return 0;
 }
 

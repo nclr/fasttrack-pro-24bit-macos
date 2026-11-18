@@ -57,7 +57,8 @@ FT_TONE=1 make -C driver test   # same, with 440 Hz on outputs 1-2 and 660 Hz on
 
 The plug-in logs a health line 30 s after it starts streaming and afterwards only when
 something goes wrong. Healthy playback looks like
-`last 30 s: 0 retries, 0 gaps, 0 underruns, 0 errors`.
+`last 30 s: 0 retries, 0 gaps, 0 underruns, 0 errors`. USB errors and gaps are followed
+by a reset of the card at the next quiet moment (`stream stopped (to reset the card)`).
 
 ## The problem
 
@@ -115,7 +116,14 @@ of the two the headphones hear.
    streamed with isochronous writes. The endpoints are adaptive, so instead of
    resampling the plug-in sends 44–45 or 47–49 samples per 1 ms USB frame to follow the
    device clock. At full volume samples pass through unaltered.
-4. When the card is unplugged, the device disappears; when it comes back, it is
+4. The stream runs only while an app plays to the device: it starts when Core Audio starts
+   IO and stops 5 s after IO stops. It also stops before the Mac sleeps.
+5. Any USB error, gap or frame that did not go out whole may have shifted the card, and
+   the card cannot tell. After one, the plug-in re-enumerates the card once it has played
+   5 s of silence (or nothing plays). The device stays in the list meanwhile, so the output
+   selection does not change; sound started during the few seconds of the reset is lost.
+   The same happens after waking if the stream was still running when the Mac went to sleep.
+6. When the card is unplugged, the device disappears; when it comes back, it is
    claimed again.
 
 Features:
@@ -140,12 +148,19 @@ Limitations:
 ### If it plays noise or nothing
 
 The card has no way to report how it splits the byte stream into samples, and a wrong
-split plays as loud noise or as silence. The plug-in resets the card before every stream,
-which has always fixed it so far. If it does happen:
+split plays as loud noise or as silence. The plug-in resets the card when it is plugged in
+and after any USB trouble, at the next quiet moment. If it does happen:
 
+- for silence on headphones, check the A/B button first: pressed in, the headphones hear
+  outputs 3–4, where ordinary apps do not play
+- pause for 5 seconds: if the plug-in saw USB errors, it resets the card then, or
 - unplug the card and plug it in again (the plug-in resets it before streaming), or
 - with the source tree, run `tools/ftconfig reset` while the plug-in is installed: the
   plug-in claims the card again after the reset. Sound stops for about three seconds.
+
+USB errors are more likely when the card shares a hub with other devices, especially a
+cheap hub with a single transaction translator shared by every full-speed device on it.
+Plugging the card into its own port makes them rarer.
 
 ## How it was found
 
@@ -197,6 +212,12 @@ Results with alt 2 at 48 kHz (the first ones on a card in an unknown state, see 
   nothing. Stray bytes can't be used to realign the card.
 - 440 Hz on outputs 1–2 and 660 Hz on outputs 3–4 at the same time: the low tone with the
   A/B button out, the high tone with it in.
+- Plug-in 1.5 streamed silence to the card around the clock, whether anything played or
+  not. With the card on a hub shared with other USB devices, the stream logged a few USB
+  errors and gaps every 30 s through a night when nothing played. In the morning the
+  stream was healthy again but the card did not play, and kept not playing until the Mac
+  restarted. Version 1.6 streams only while something plays and resets the card after USB
+  trouble.
 
 ## Repository layout
 
